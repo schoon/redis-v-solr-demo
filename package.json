@@ -1,0 +1,18 @@
+{
+  "name": "redis-v-solr-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Side-by-side counterparty search: Redis Query Engine vs Apache Solr",
+  "main": "src/server.js",
+  "scripts": {
+    "generate": "node src/generate.js",
+    "seed:redis": "node src/seed-redis.js",
+    "seed:solr": "node src/seed-solr.js",
+    "seed": "npm run generate && npm run seed:redis && npm run seed:solr",
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "redis": "^4.7.1"
+  }
+}

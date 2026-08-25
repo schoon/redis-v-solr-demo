@@ -1,0 +1,42 @@
+# Both engines run locally so the comparison is apples-to-apples: same laptop,
+# same CPU, same dataset, no network in between.
+#
+# Redis is on 6380 rather than the default 6379 to avoid colliding with any
+# Redis you already have running.
+
+services:
+  redis:
+    # Redis 8 ships the Query Engine (the search module) in the core image —
+    # no redis-stack needed. FT.CREATE / FT.SEARCH are available out of the box.
+    image: redis:8
+    container_name: rvs-redis
+    ports:
+      - "6380:6379"
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  solr:
+    image: solr:9
+    container_name: rvs-solr
+    ports:
+      - "8983:8983"
+    # solr-precreate builds the core on first boot so there's no manual step.
+    command:
+      - solr-precreate
+      - counterparties
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -sf 'http://localhost:8983/solr/counterparties/admin/ping?wt=json' || exit 1"
+      interval: 5s
+      timeout: 5s
+      retries: 20
