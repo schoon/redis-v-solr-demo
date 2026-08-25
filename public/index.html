@@ -134,6 +134,12 @@
         <option value="25">25</option>
       </select>
     </label>
+    <label class="inline">order
+      <select id="order">
+        <option value="name" selected>name</option>
+        <option value="relevance">relevance</option>
+      </select>
+    </label>
   </div>
 
   <div class="filters" id="filters">
@@ -264,7 +270,12 @@
       strong.textContent = h.legal_name || '';
       const sub = document.createElement('div');
       sub.className = 'tag';
-      sub.textContent = h.entity_type || '';
+      // Aliases have to be visible. A search for "kes" legitimately returns
+      // "Aberdare Advisory GmbH" when it carries the alias "Kestrel Advisory
+      // (former)" — a pre-merger name, which is exactly the counterparty
+      // matching problem this demo is about. Without showing the alias, that
+      // row looks like a wrong result.
+      sub.textContent = [h.entity_type, h.aliases].filter(Boolean).join(' · ');
       name.append(strong, sub);
       const c = document.createElement('td');
       c.textContent = h.country || '';
@@ -311,6 +322,7 @@
       scenario,
       q: el('q').value,
       runs: el('runs').value,
+      order: el('order').value,
       limit: '10',
     });
     if (SCENARIOS[scenario].filters) {
@@ -357,7 +369,20 @@
     renderRows(el('srows'), d.solr.hits);
     renderBars(d.redis.ms, d.solr.ms, d.solr.qtime);
 
+    const orderNote = d.order === 'name'
+      ? '<b>Ordered by name on both sides,</b> so the two panes are directly comparable. ' +
+        'Wildcard and prefix queries score every match identically on both engines, so with ' +
+        'relevance ordering "top 10" is decided by each engine’s internal document order and the ' +
+        'panes show a different arbitrary ten out of the same result set. Switch order to ' +
+        '<b>relevance</b> to see that — and note Redis does differentiate scores on fuzzy queries, ' +
+        'which a name sort discards. '
+      : '<b>Ordered by relevance,</b> so the panes may list different rows even when the totals ' +
+        'match: on wildcard and prefix queries every hit scores identically, so the tie is broken ' +
+        'by each engine’s internal document order. Switch order to <b>name</b> for a row-for-row ' +
+        'comparison. ';
+
     el('method').innerHTML =
+      orderNote +
       '<b>How this is measured.</b> Both engines run the same query the same number of times, ' +
       'alternating which goes first, and the <b>median</b> is reported — not the best case. ' +
       'Times are wall clock as the application sees them, including protocol and deserialisation. ' +
@@ -375,6 +400,7 @@
     debounce = setTimeout(search, 120);
   });
   el('runs').addEventListener('change', search);
+  el('order').addEventListener('change', search);
   for (const id of ['countries', 'minRating', 'status']) {
     el(id).addEventListener('change', search);
   }

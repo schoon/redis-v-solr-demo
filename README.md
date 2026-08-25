@@ -44,6 +44,36 @@ docker compose down           # add -v to delete the volumes too
 The exact query sent to each engine is displayed under its results pane, so
 there's nothing hidden.
 
+### Result ordering
+
+There's an **order** toggle, defaulting to **name**.
+
+Wildcard and prefix queries are constant-scored on both engines — a search for
+`kes*` returned 2,205 hits from Redis all scoring `6.9221677`, and the same 2,205
+from Solr all scoring `5.0`. When every match ties, "top 10" is settled by each
+engine's internal document order, which differs, so the two panes showed a
+different arbitrary ten out of an identical result set. That reads as the engines
+disagreeing when they don't.
+
+Sorting both sides by name fixes it: the panes then match row for row, and on a
+fully tied result set nothing is lost. Redis sorts on the `SORTABLE` copy of
+`legal_name`; Solr sorts on `legal_name_sort`, a lowercased untokenised copy —
+lowercased because Redis normalises sortable text to lowercase while a Solr
+`string` sorts raw bytes, so otherwise `"…plc"` and `"…Pty Ltd"` would order
+differently on the two engines.
+
+Switch to **relevance** to discuss ranking instead. Worth knowing: Redis *does*
+differentiate scores on fuzzy queries (they spread across 10.94–11.49 for
+`kestral capitol`), so the name sort discards real ranking information there.
+That's why it's a toggle and not a hardcoded sort.
+
+### Why a search for "kes" returns "Aberdare Advisory GmbH"
+
+Because that record carries the alias `Kestrel Advisory (former)`. Aliases are
+indexed and displayed beneath each legal name, which is the point: the same
+entity arrives as a short form from one system and a pre-merger name from
+another, and a counterparty search has to find it either way.
+
 ## Observed on one laptop
 
 Median of 11 runs, 100,000 counterparties, Redis 8.10.1 and Solr 9 both in

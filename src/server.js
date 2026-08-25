@@ -25,8 +25,8 @@ function median(values) {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
-async function runRedis(scenario, terms, filters, limit) {
-  const { index, query, options } = redisSearchArgs(scenario, terms, filters, limit);
+async function runRedis(scenario, terms, filters, limit, order) {
+  const { index, query, options } = redisSearchArgs(scenario, terms, filters, limit, order);
   const t0 = nowMs();
   // FT.SEARCH cp:idx <query> LIMIT 0 <limit> RETURN ...
   // Redis parses the query, walks the inverted index and returns matching
@@ -37,8 +37,8 @@ async function runRedis(scenario, terms, filters, limit) {
   return { ms, total: res.total, docs: res.documents };
 }
 
-async function runSolr(scenario, terms, filters, limit) {
-  const params = solrParams(scenario, terms, filters, limit);
+async function runSolr(scenario, terms, filters, limit, order) {
+  const params = solrParams(scenario, terms, filters, limit, order);
   const t0 = nowMs();
   const res = await fetch(`${SOLR_URL}/select?${params.toString()}`);
   const body = await res.json();
@@ -86,6 +86,7 @@ app.get('/api/search', async (req, res) => {
   const terms = sanitize(req.query.q);
   const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), 50);
   const runs = Math.min(Math.max(Number(req.query.runs) || 1, 1), 25);
+  const order = req.query.order === 'relevance' ? 'relevance' : 'name';
 
   const filters = {
     countries: String(req.query.countries || '')
@@ -112,11 +113,11 @@ app.get('/api/search', async (req, res) => {
     // scheduler luck). The median of the runs is reported, not the best case.
     for (let i = 0; i < runs; i += 1) {
       if (i % 2 === 0) {
-        redisResult = await runRedis(scenario, terms, filters, limit);
-        solrResult = await runSolr(scenario, terms, filters, limit);
+        redisResult = await runRedis(scenario, terms, filters, limit, order);
+        solrResult = await runSolr(scenario, terms, filters, limit, order);
       } else {
-        solrResult = await runSolr(scenario, terms, filters, limit);
-        redisResult = await runRedis(scenario, terms, filters, limit);
+        solrResult = await runSolr(scenario, terms, filters, limit, order);
+        redisResult = await runRedis(scenario, terms, filters, limit, order);
       }
       redisTimes.push(redisResult.ms);
       solrTimes.push(solrResult.ms);
@@ -128,6 +129,7 @@ app.get('/api/search', async (req, res) => {
     res.json({
       scenario,
       runs,
+      order,
       terms,
       redis: {
         ms: Number(redisMs.toFixed(3)),
@@ -140,7 +142,7 @@ app.get('/api/search', async (req, res) => {
         qtime: solrResult.qtime,
         total: solrResult.total,
         hits: normalise(solrResult.docs),
-        query: decodeURIComponent(solrParams(scenario, terms, filters, limit).toString()),
+        query: decodeURIComponent(solrParams(scenario, terms, filters, limit, order).toString()),
       },
       // Only meaningful when both engines found the same number of documents —
       // the UI greys the multiplier out when the totals disagree, because a

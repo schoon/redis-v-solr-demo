@@ -31,6 +31,15 @@ const BATCH = 5000;
 // papering over the difference in the response handler.
 const FIELDS = [
   { name: 'legal_name', type: 'text_general', indexed: true, stored: true, multiValued: false },
+  // Sort-only companion to legal_name. You can't sort on a tokenised text
+  // field, so this holds an untokenised copy with docValues.
+  //
+  // It is populated *lowercased* on purpose. Redis normalises SORTABLE TEXT to
+  // lowercase, while a Solr `string` field sorts by raw bytes — so with the
+  // original casing, "Kestrel Capital plc" and "Kestrel Capital Pty Ltd" would
+  // order differently on the two engines ('P' is 0x50, 'p' is 0x70). Matching
+  // Redis's normalisation is what makes the two panes line up exactly.
+  { name: 'legal_name_sort', type: 'string', indexed: false, stored: false, docValues: true, multiValued: false },
   { name: 'aliases', type: 'text_general', indexed: true, stored: true, multiValued: false },
   { name: 'parent_name', type: 'text_general', indexed: true, stored: true, multiValued: false },
   { name: 'city', type: 'text_general', indexed: true, stored: true, multiValued: false },
@@ -121,6 +130,7 @@ async function main() {
     batch.push({
       id: rec.id,
       legal_name: rec.legal_name,
+      legal_name_sort: rec.legal_name.toLowerCase(),
       aliases: rec.aliases,
       parent_name: rec.parent_name,
       city: rec.city,

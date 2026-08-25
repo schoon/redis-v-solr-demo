@@ -79,21 +79,49 @@ const REDIS_RETURN = [
   'credit_rating', 'rating_score', 'risk_score', 'status',
 ];
 
-function redisSearchArgs(scenario, terms, filters, limit) {
+// order = 'name' | 'relevance'
+//
+// Why 'name' is the default: for wildcard and prefix queries both engines apply
+// constant scoring, so every match ties on relevance — Redis returned 2,205
+// hits all scoring 6.9221677, Solr the same 2,205 all scoring 5.0. With a total
+// tie, "top 10" is decided by each engine's internal document order, which
+// differs, so the two panes showed a different arbitrary ten out of the same
+// set. Sorting both by name makes them line up row for row, and on a fully
+// tied result set nothing is lost by doing so.
+//
+// It is not free on the fuzzy scenario, though: there Redis *does* differentiate
+// (scores spread across 10.94-11.49), so a name sort discards real ranking
+// information. Hence the toggle rather than a hardcoded sort.
+function redisSearchArgs(scenario, terms, filters, limit, order = 'name') {
+  const options = {
+    LIMIT: { from: 0, size: limit },
+    RETURN: REDIS_RETURN,
+  };
+
+  if (order === 'name') {
+    // legal_name is declared SORTABLE, so this reads a stored normalised copy
+    // rather than re-deriving it per query.
+    options.SORTBY = { BY: 'legal_name', DIRECTION: 'ASC' };
+  }
+
   return {
     index: REDIS_INDEX,
     query: redisQuery(scenario, terms, filters),
-    options: {
-      LIMIT: { from: 0, size: limit },
-      RETURN: REDIS_RETURN,
-    },
+    options,
   };
 }
 
 // ---------------------------------------------------------------- Solr
 
-function solrParams(scenario, terms, filters, limit) {
+function solrParams(scenario, terms, filters, limit, order = 'name') {
   const params = new URLSearchParams();
+
+  // Matches the Redis SORTBY above. legal_name_sort is the lowercased,
+  // untokenised copy — see the schema comment in seed-solr.js for why the
+  // lowercasing is required for the two orderings to agree.
+  if (order === 'name') {
+    params.set('sort', 'legal_name_sort asc');
+  }
 
   // edismax gives Solr the multi-field-with-boosts behaviour that Redis gets
   // from `@legal_name|aliases` plus WEIGHT in the schema. Same boosts: 5 and 2.
