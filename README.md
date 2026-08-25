@@ -9,6 +9,8 @@ matching, type-ahead, filtered screening, geo proximity, portfolio aggregation,
 identifier lookup and throughput under load — the query shapes that actually show
 up in KYC and onboarding workflows.
 
+![The demo: typo-tolerant name search, both engines side by side](docs/screenshot-demo.png)
+
 ## Quick start
 
 Requires **Docker** and **Node.js 18+**. Copy-paste the whole block:

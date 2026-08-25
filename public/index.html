@@ -134,6 +134,13 @@
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 0.7rem; color: var(--muted); padding: 0.55rem 0.9rem;
       border-bottom: 1px solid var(--line); word-break: break-all; background: #12151b;
+      /* Fixed height so both panes' tables start at the same y. Solr's query
+         string wraps to three or four lines where Redis's fits on one, and
+         without this the two result tables drift out of vertical alignment,
+         which defeats the point of showing them side by side. Longer queries
+         scroll inside the block rather than pushing the table down. */
+      min-height: 5rem; max-height: 5rem; overflow-y: auto;
+      white-space: pre-wrap;
     }
     table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
     th { text-align: left; padding: 0.4rem 0.9rem; color: var(--muted); font-size: 0.68rem;
@@ -323,7 +330,6 @@
 
     <div class="intro-foot">
       <button id="enterDemo" class="cta">Open the demo &rarr;</button>
-      <span class="corpus" id="landingCorpus"></span>
     </div>
 
     <p class="method-line">
@@ -335,18 +341,18 @@
 
   <div id="demo" hidden>
   <div class="scenarios" id="scenarios">
-    <button data-s="fuzzy" class="active">Typo-tolerant name</button>
-    <button data-s="prefix">Prefix / autocomplete</button>
-    <button data-s="filtered">Filtered screening</button>
-    <button data-s="geo">Geo proximity</button>
-    <button data-s="facet">Portfolio breakdown</button>
-    <button data-s="lei">Exact LEI lookup</button>
-    <button data-s="throughput">Concurrent throughput</button>
-    <button data-s="index">Index &amp; schema</button>
+    <button data-s="fuzzy" class="active">Typo-tolerant</button>
+    <button data-s="prefix">Prefix</button>
+    <button data-s="filtered">Filtered</button>
+    <button data-s="geo">Geo</button>
+    <button data-s="facet">Breakdown</button>
+    <button data-s="lei">LEI lookup</button>
+    <button data-s="throughput">Throughput</button>
+    <button data-s="index">Index</button>
   </div>
   <p class="hint" id="hint"></p>
   <p class="shortcuts">
-    <kbd>1</kbd>–<kbd>7</kbd> scenarios · <kbd>Enter</kbd> re-run ·
+    <kbd>1</kbd>–<kbd>8</kbd> scenarios · <kbd>Enter</kbd> re-run ·
     <kbd>P</kbd> presentation mode · <kbd>Esc</kbd> overview
   </p>
 
@@ -1316,13 +1322,12 @@
         `<b>${s.redis.docs.toLocaleString()}</b> counterparties in Redis · ` +
         `<b>${s.solr.docs.toLocaleString()}</b> in Solr` +
         (match ? ' · identical corpus' : ' · <span style="color:#d8a02a">COUNTS DIFFER</span>');
+      // Shown once, in the header, which is visible on both views. An earlier
+      // version repeated it beside the landing button, which read as an
+      // accidental duplicate rather than emphasis.
       el('corpus').innerHTML = text;
-      // Repeated on the landing page: whether the two corpora actually match is
-      // the first thing that makes any later number meaningful.
-      el('landingCorpus').innerHTML = text;
     } catch {
-      el('corpus').textContent = 'could not read corpus stats';
-      el('landingCorpus').textContent = 'could not read corpus stats — is the server seeded?';
+      el('corpus').textContent = 'could not read corpus stats — is the server seeded?';
     }
 
     buildChips();
