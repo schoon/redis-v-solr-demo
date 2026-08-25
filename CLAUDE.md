@@ -89,6 +89,13 @@ identical data. Don't introduce `Math.random()` into the generator.
 **Redis is on 6380.** Deliberately not 6379, so the demo can't collide with a
 Redis the presenter already has running. Don't "tidy" it back to the default.
 
+**Don't reintroduce a memory comparison.** An earlier README quoted container
+memory as a Redis win (245 MB vs 2.3 GB) and it was wrong: `-Xms2g` preallocates,
+so Solr's container reports 2.3 GB regardless of corpus, and its actual on-disk
+index is 27 MB against roughly 133 MB resident in Redis. Solr's index is
+*smaller*. Redis trades RAM for latency — that's the honest framing, and it's the
+one in the README.
+
 ## The throughput benchmark
 
 `src/bench.js`, run via `npm run bench`. Four things about it are load-bearing;

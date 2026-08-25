@@ -108,10 +108,35 @@ place to run this demo.
 The name sort is also cheap at this size — Redis moves by well under a
 millisecond between `order=relevance` and `order=name`, versus roughly 2× at 1M.
 
-One caveat on memory: Solr's heap is pinned at 2 GB (`-Xms2g`) because the 1M run
-needed it, so the container reports ~2.3 GB regardless of corpus size. Don't
-quote memory at 100k from this configuration — Solr would run comfortably in far
-less. Redis sits at ~245 MB.
+### Memory is deliberately not compared
+
+An earlier draft of this README quoted container memory — Redis ~245 MB against
+Solr ~2.3 GB. That comparison was wrong in Redis's favour and has been removed.
+
+Measured properly at 100k:
+
+| | Redis | Solr |
+| --- | ----- | ---- |
+| Process / heap | 133 MB used | 864 MB heap *used*, of a 2 GB pinned heap |
+| Index on disk | n/a — index lives in RAM | **27 MB** |
+
+Three reasons the figures don't compare:
+
+- **The JVM's heap is preallocated,** not consumed. `-Xms2g` means the container
+  reports ~2.3 GB whatever the corpus size, and a JVM with headroom doesn't
+  collect aggressively — 864 MB "used" is not 864 MB "needed".
+- **Solr's index is far smaller in bytes.** 27 MB on disk against roughly 133 MB
+  resident in Redis. Lucene keeps a compact on-disk index and leans on the OS
+  page cache; Redis holds the data and index in RAM by design. That is the
+  architectural trade the latency numbers are buying.
+- **The two aren't measuring the same thing.** Redis's RSS is the dataset. Solr's
+  RSS is a JVM, and its working set depends on page cache you can't attribute to
+  the process.
+
+If a customer asks about memory, the honest answer is that Redis trades RAM for
+latency, Solr trades latency for a smaller resident footprint, and sizing needs
+their corpus rather than a number from this demo. Quoting these figures as a
+Redis win would not survive a second question.
 
 ## Concurrent throughput
 
@@ -223,7 +248,11 @@ Some of that gap was self-inflicted and is worth understanding:
 | Commit before searchable | none | required |
 | Write-to-visible | ~5 ms | until commit, or your soft-commit window |
 | Known-key retrieval | `HGETALL`, O(1), index not consulted | query only |
-| Memory | 1.32 GB | 2.30 GB (fixed 2 GB heap) |
+
+Memory is not in that table on purpose — see [Memory is deliberately not
+compared](#memory-is-deliberately-not-compared). At 1M, Redis holds 1.32 GB
+resident while Solr's on-disk index is a fraction of that; the container's
+2.3 GB is a preallocated heap, not consumption.
 
 The defensible 1M story is **freshness, ingest and identifier lookup**, not
 "faster search across the board". If the customer's corpus is that size and
