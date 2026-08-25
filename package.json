@@ -9,6 +9,7 @@
     "seed:redis": "node src/seed-redis.js",
     "seed:solr": "node src/seed-solr.js",
     "seed": "npm run generate && npm run seed:redis && npm run seed:solr",
+    "seed:1m": "COUNT=1000000 npm run seed",
     "start": "node src/server.js"
   },
   "dependencies": {

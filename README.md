@@ -98,6 +98,64 @@ Methodology.
 | Exact LEI (`HGETALL`) | ~0.3 ms | ~2.1 ms | ~0 ms | ~7.7× |
 | **Portfolio breakdown** | **~7.5 ms** | **~5.3 ms** | ~2 ms | **0.7× — Solr wins** |
 
+## At 1,000,000 counterparties the result largely inverts
+
+Read this before presenting. The 100k numbers above do **not** scale.
+
+`npm run seed:1m` loads 1,000,000 records. Median of 11 runs, same laptop,
+Solr on a 2 GB heap, Redis using all 14 cores:
+
+| Scenario | Redis | Solr | Winner |
+| -------- | ----- | ---- | ------ |
+| Exact LEI (`HGETALL`) | 0.32 ms | 2.68 ms | **Redis, 8.3×** |
+| Typo-tolerant name | 2.19 ms | 4.09 ms | **Redis, 1.9×** |
+| Prefix | 3.57 ms | 3.21 ms | Solr, 1.1× |
+| Filtered screening | 6.93 ms | 3.46 ms | Solr, 2.0× |
+| Geo, 50 km | 5.00 ms | 3.09 ms | Solr, 1.6× |
+| Portfolio breakdown | 76.2 ms | 20.4 ms | Solr, 3.7× |
+
+Redis still wins decisively on **known-key lookup** and clearly on **fuzzy name
+matching**. Solr wins prefix, filtering, geo and aggregation. At 100k Redis led
+almost everything; at 1M it doesn't.
+
+Some of that gap was self-inflicted and is worth understanding:
+
+- **The name sort costs Redis roughly 2× on large result sets.** `SORTBY` sorts
+  the whole matching set — prefix `stonebr` matches 22,228 documents and went
+  from 3.57 ms to 6.53 ms; geo from 5.00 ms to 9.81 ms. Solr sorts via docValues
+  with early termination and barely moves. The figures above use
+  `order=relevance` to exclude this; the UI's default `order=name` is slower for
+  Redis at scale.
+- **Solr's filterCache rewards repeated queries, and the median-of-N method
+  feeds it.** Asking the same filtered query 15 times: Solr 3.08 ms vs Redis
+  6.59 ms (2.0×). Asking 12 *distinct* queries once each: Solr 6.00 ms vs Redis
+  7.22 ms (1.2×). Solr caches `fq` bitsets across queries; Redis re-evaluates.
+  Most of Solr's advantage on the filtered scenario is cache reuse, so quote the
+  1.2× if the customer's workload is high-cardinality ad-hoc search, and the 2×
+  if they re-run similar screens.
+- **It is not a threading or memory handicap.** `FT.CONFIG GET WORKERS` reports
+  14, matching the host's 14 cores, and Solr's heap was raised to 2 GB precisely
+  so it wasn't the constraint. `FT.PROFILE` puts 14 ms of the filtered query in
+  the `Index` processor: `status:ACTIVE` alone matches 750,186 documents, and
+  intersecting that with a prefix expansion is simply real work Redis redoes each
+  time.
+
+**What still holds at 1M**, and what to lead with there:
+
+| | Redis | Solr |
+| --- | ----- | ---- |
+| Ingest rate | 47,600 docs/sec | 28,500 docs/sec |
+| Commit before searchable | none | required |
+| Write-to-visible | ~5 ms | until commit, or your soft-commit window |
+| Known-key retrieval | `HGETALL`, O(1), index not consulted | query only |
+| Memory | 1.32 GB | 2.30 GB (fixed 2 GB heap) |
+
+The defensible 1M story is **freshness, ingest and identifier lookup**, not
+"faster search across the board". If the customer's corpus is that size and
+their workload is prefix, filter and facet heavy, this demo will not support a
+Redis-wins conclusion — and pretending otherwise in front of their search team
+would be worse than conceding it.
+
 ### Solr wins the aggregation scenario
 
 That last row is not a mistake and it is not there for balance. Grouping 100,000

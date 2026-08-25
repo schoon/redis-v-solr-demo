@@ -29,6 +29,13 @@ services:
     container_name: rvs-solr
     ports:
       - "8983:8983"
+    environment:
+      # The image defaults to a 512MB heap, which is too tight once the corpus
+      # reaches ~1M documents: docValues-backed facets and sorts start thrashing
+      # GC, and a heap-starved JVM would make Solr look slow for reasons that
+      # have nothing to do with Solr. Redis is given no memory ceiling either,
+      # so neither engine is being squeezed.
+      SOLR_HEAP: 2g
     # solr-precreate builds the core on first boot so there's no manual step.
     command:
       - solr-precreate
