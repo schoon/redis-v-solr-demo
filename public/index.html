@@ -137,6 +137,51 @@
       border-radius: 8px; font-size: 0.78rem; color: var(--muted);
     }
     .note b { color: var(--text); font-weight: 600; }
+
+    /* ---- landing view ---- */
+    .overview-link {
+      margin-left: auto; color: var(--muted); font-size: 0.8rem;
+      text-decoration: none;
+    }
+    .overview-link:hover { color: var(--text); text-decoration: underline; }
+    .lede {
+      font-size: 1.05rem; max-width: 46rem; margin: 1.25rem 0 1.75rem;
+      color: #c9cdd6;
+    }
+    .lede b { color: var(--text); font-weight: 620; }
+    .intro-grid {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem;
+    }
+    @media (max-width: 900px) { .intro-grid { grid-template-columns: 1fr; } }
+    .intro-card {
+      background: var(--panel); border: 1px solid var(--line);
+      border-radius: 10px; padding: 1rem 1.1rem;
+    }
+    .intro-card:nth-child(1) { border-top: 2px solid var(--redis); }
+    .intro-card:nth-child(2) { border-top: 2px solid var(--good); }
+    .intro-card:nth-child(3) { border-top: 2px solid #d8a02a; }
+    .intro-card h3 {
+      margin: 0 0 0.5rem; font-size: 0.9rem; font-weight: 620;
+    }
+    .intro-card p { margin: 0 0 0.7rem; font-size: 0.82rem; color: var(--muted); }
+    ul.tight { margin: 0; padding-left: 1.05rem; font-size: 0.8rem; color: var(--muted); }
+    ul.tight li { margin-bottom: 0.35rem; }
+    ul.tight b { color: #d5d9e0; font-weight: 600; }
+    ul.tight i { color: var(--muted); }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.9em; background: #12151b; padding: 0.05rem 0.3rem;
+      border-radius: 3px;
+    }
+    .intro-foot {
+      margin-top: 1.75rem; display: flex; align-items: center;
+      gap: 1rem; flex-wrap: wrap;
+    }
+    button.cta {
+      background: var(--redis); border-color: var(--redis); color: #fff;
+      font-weight: 600; padding: 0.65rem 1.3rem; font-size: 0.95rem;
+    }
+    button.cta:hover { filter: brightness(1.1); background: var(--redis); }
   </style>
 </head>
 <body>
@@ -144,8 +189,84 @@
   <header>
     <h1>Counterparty Search</h1>
     <span class="corpus" id="corpus">checking corpus…</span>
+    <a href="#" id="backToOverview" class="overview-link" hidden>← overview</a>
   </header>
 
+  <!-- Landing view. Shown first so a room gets the premise, the method and the
+       caveats before anyone reads a number off a chart. -->
+  <section id="landing">
+    <p class="lede">
+      The same 100,000 counterparties, indexed in <b>Redis Query Engine</b> and in
+      <b>Apache Solr</b>, on this laptop, queried side by side with the latency of
+      each shown live.
+    </p>
+
+    <div class="intro-grid">
+      <div class="intro-card">
+        <h3>What it compares</h3>
+        <p>
+          Seven query shapes drawn from KYC and counterparty onboarding work —
+          the searches an analyst actually runs, not synthetic microbenchmarks.
+        </p>
+        <ul class="tight">
+          <li><b>Typo-tolerant name</b> — "our file says <i>Kestral Capitol</i>"</li>
+          <li><b>Prefix / autocomplete</b> — one query per keystroke</li>
+          <li><b>Filtered screening</b> — eight filters: jurisdiction, rating,
+              status, type, sector, risk, exposure, onboarding date</li>
+          <li><b>Geo proximity</b> — within N km of a financial centre</li>
+          <li><b>Portfolio breakdown</b> — exposure grouped by rating or sector</li>
+          <li><b>Exact LEI lookup</b> — retrieval by identifier</li>
+          <li><b>Concurrent throughput</b> — QPS and tail latency under load</li>
+        </ul>
+      </div>
+
+      <div class="intro-card">
+        <h3>How it stays fair</h3>
+        <p>
+          This is vendor-authored, so the method is stated up front and the code
+          is short enough to audit. <code>src/queries.js</code> holds both
+          engines' query construction in one file, on purpose.
+        </p>
+        <ul class="tight">
+          <li>One generator feeds both engines from a fixed seed</li>
+          <li>Schemas declared explicitly on both sides, matching field types
+              and identical 5&nbsp;/&nbsp;2 name boosts</li>
+          <li>Same edit distance, and <code>mm=100%</code> so Solr requires
+              every term as Redis does</li>
+          <li>Solr's caches warmed at seed time; HTTP keep-alive verified</li>
+          <li>Median of N runs, never the best case, with the running order
+              alternated</li>
+          <li>No speed multiplier is displayed unless both engines returned the
+              same result count</li>
+        </ul>
+      </div>
+
+      <div class="intro-card">
+        <h3>What it does <i>not</i> claim</h3>
+        <p>
+          The uncomfortable parts are on screen rather than in a footnote,
+          because a customer's search architect will find them anyway.
+        </p>
+        <ul class="tight">
+          <li><b>Solr wins the portfolio breakdown</b> — its facet engine over
+              column-oriented docValues is genuinely better at aggregation</li>
+          <li>Solr's internal <code>QTime</code> is near zero; much of its wall
+              clock is HTTP and JSON. Both numbers are shown</li>
+          <li>At <b>1,000,000</b> records the latency result largely inverts —
+              see the README before quoting anything at that scale</li>
+          <li>Nothing here speaks to corpora larger than RAM, distributed
+              operation, or relevance quality</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="intro-foot">
+      <button id="enterDemo" class="cta">Open the demo →</button>
+      <span class="corpus" id="landingCorpus"></span>
+    </div>
+  </section>
+
+  <div id="demo" hidden>
   <div class="scenarios" id="scenarios">
     <button data-s="fuzzy" class="active">Typo-tolerant name</button>
     <button data-s="prefix">Prefix / autocomplete</button>
@@ -329,6 +450,7 @@
   </div>
 
   <div class="note" id="method"></div>
+  </div><!-- /#demo -->
 </div>
 
 <script>
@@ -799,6 +921,23 @@
     if (e.target.dataset.s) setScenario(e.target.dataset.s);
   });
 
+  // ---- landing / demo view switching -------------------------------------
+
+  function showDemo(on) {
+    el('landing').hidden = on;
+    el('demo').hidden = !on;
+    el('backToOverview').hidden = !on;
+    // Deep-linkable, so a presenter can bookmark straight into the demo.
+    history.replaceState(null, '', on ? '#demo' : '#');
+    if (on) setScenario(scenario);
+  }
+
+  el('enterDemo').addEventListener('click', () => showDemo(true));
+  el('backToOverview').addEventListener('click', (e) => {
+    e.preventDefault();
+    showDemo(false);
+  });
+
   (async () => {
     try {
       // Geo centres come from the server so the dropdown can't drift from the
@@ -815,14 +954,21 @@
     try {
       const s = await (await fetch('/api/stats')).json();
       const match = s.redis.docs === s.solr.docs;
-      el('corpus').innerHTML =
+      const text =
         `<b>${s.redis.docs.toLocaleString()}</b> counterparties in Redis · ` +
         `<b>${s.solr.docs.toLocaleString()}</b> in Solr` +
         (match ? ' · identical corpus' : ' · <span style="color:#d8a02a">COUNTS DIFFER</span>');
+      el('corpus').innerHTML = text;
+      // Repeated on the landing page: whether the two corpora actually match is
+      // the first thing that makes any later number meaningful.
+      el('landingCorpus').innerHTML = text;
     } catch {
       el('corpus').textContent = 'could not read corpus stats';
+      el('landingCorpus').textContent = 'could not read corpus stats — is the server seeded?';
     }
-    setScenario('fuzzy');
+
+    // Land on the overview unless the URL asks for the demo directly.
+    showDemo(location.hash === '#demo');
   })();
 </script>
 </body>
