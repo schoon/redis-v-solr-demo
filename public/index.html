@@ -6,6 +6,10 @@
   <title>Counterparty Search — Redis vs Solr</title>
   <style>
     :root {
+      /* Without this, the OS renders native form controls (select popups,
+         multi-select list boxes, scrollbars) in its light palette, which on a
+         dark page means light text on a white background — unreadable. */
+      color-scheme: dark;
       --bg: #0f1115;
       --panel: #171a21;
       --panel-2: #1d212a;
@@ -49,6 +53,31 @@
     }
     input[type="text"] { flex: 1; min-width: 14rem; }
     input:focus, select:focus { outline: 1px solid #4a5262; }
+
+    /* The dropdown popup and the multi-select list boxes are drawn by the OS
+       and don't inherit from the <select>, so they need stating explicitly.
+       The multi-selects (country, type, sector) were the unreadable ones. */
+    select option,
+    select optgroup {
+      background-color: var(--panel-2);
+      color: var(--text);
+    }
+    select option:checked,
+    select option:hover {
+      background-color: #2f3644;
+      color: #fff;
+    }
+    select[multiple] {
+      background-color: var(--panel);
+      color: var(--text);
+      padding: 0.35rem 0.4rem;
+      overflow-y: auto;
+    }
+    /* Firefox needs the selected-row colour forced via a gradient, as it
+       ignores background-color on option:checked. */
+    select[multiple] option:checked {
+      background: linear-gradient(#2f3644, #2f3644);
+    }
     label.inline { color: var(--muted); font-size: 0.8rem; display: flex; align-items: center; gap: 0.35rem; }
     .filters { display: none; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.6rem; align-items: center; }
     .filters.show { display: flex; }
