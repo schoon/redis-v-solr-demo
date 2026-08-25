@@ -9,6 +9,9 @@ const {
   sanitize, redisQuery, redisSearchArgs, solrParams,
   redisAggregateArgs, solrFacetParams, redisLeiKey, solrLeiParams,
 } = require('./queries');
+// Not client.ft.info() — its positional parser is shifted against Redis 8's
+// reply. See src/ft-info.js.
+const { ftInfo, toCreateCommand } = require('./ft-info');
 
 // Financial centres offered by the geo scenario. Coordinates are [lat, lon];
 // each engine's query builder reorders as needed.
@@ -385,6 +388,74 @@ app.get('/api/sample-lei', async (req, res) => {
   }
 });
 
+// GET /api/index-info — what actually got built on each side.
+//
+// Shows the Redis index definition and its cost next to the Solr schema. It's
+// also the clearest view of the setup difference: one FT.CREATE against a core
+// plus a schema declaration per field.
+app.get('/api/index-info', async (req, res) => {
+  try {
+    const info = await ftInfo(redis, REDIS_INDEX);
+
+    const fieldsRes = await fetch(`${SOLR_URL}/schema/fields?wt=json`);
+    const fieldsBody = await fieldsRes.json();
+    // Solr's default schema carries its own housekeeping fields (id, _version_,
+    // _root_, _text_ and the like). Only the ones this demo declared are
+    // listed, so the two sides are comparable.
+    const redisOrder = info.attributes.map((a) => a.field);
+    const ours = new Set(redisOrder);
+    ours.add('legal_name_sort');
+    const solrFields = (fieldsBody.fields || [])
+      .filter((f) => ours.has(f.name))
+      .map((f) => ({
+        field: f.name,
+        type: f.type,
+        options: [
+          f.indexed === false ? 'indexed:false' : null,
+          f.stored === false ? 'stored:false' : null,
+          f.docValues ? 'docValues' : null,
+          f.multiValued ? 'multiValued' : null,
+        ].filter(Boolean),
+      }))
+      // Solr returns its schema alphabetically. Reordering it to follow the
+      // Redis field order makes the two panes line up row for row, so the
+      // type mapping (TEXT↔text_general, TAG↔string, NUMERIC↔pint) is readable
+      // across. Fields Redis doesn't have — legal_name_sort — go last.
+      .sort((a, b) => {
+        const ia = redisOrder.indexOf(a.field);
+        const ib = redisOrder.indexOf(b.field);
+        return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+      });
+
+    const countRes = await fetch(`${SOLR_URL}/select?q=*:*&rows=0&wt=json`);
+    const countBody = await countRes.json();
+
+    res.json({
+      redis: {
+        indexName: info.indexName,
+        keyType: info.keyType,
+        prefixes: info.prefixes,
+        fields: info.attributes,
+        createCommand: toCreateCommand(info),
+        stats: info.stats,
+      },
+      solr: {
+        core: 'counterparties',
+        fields: solrFields,
+        docs: countBody.response?.numFound ?? 0,
+        // No single command reconstructs this: the core is created by
+        // solr-precreate in docker-compose, then each field is declared through
+        // the Schema API.
+        setup: 'solr-precreate counterparties  +  POST /schema add-field × '
+          + String(solrFields.length),
+      },
+    });
+  } catch (err) {
+    console.error('index-info failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/bench-results — the last `npm run bench` run.
 //
 // Read from a file rather than generated on demand: driving a load test from
@@ -414,15 +485,15 @@ app.get('/api/meta', (req, res) => {
 // GET /api/stats — corpus size on both sides, so the UI can prove they match.
 app.get('/api/stats', async (req, res) => {
   try {
-    const info = await redis.ft.info(REDIS_INDEX);
+    const info = await ftInfo(redis, REDIS_INDEX);
     const solrRes = await fetch(`${SOLR_URL}/select?q=*:*&rows=0&wt=json`);
     const solrBody = await solrRes.json();
     res.json({
       redis: {
-        docs: Number(info.numDocs),
+        docs: info.stats.numDocs,
         indexName: REDIS_INDEX,
         // Reported so nobody has to take "Redis has no commit lag" on trust.
-        indexing: Number(info.indexing) === 1,
+        indexing: info.stats.indexing,
       },
       solr: {
         docs: solrBody.response?.numFound ?? 0,
@@ -440,7 +511,7 @@ async function start() {
   console.log(`Connected to Redis at ${REDIS_URL}`);
 
   // Fail early with a clear message rather than serving a broken demo.
-  const info = await redis.ft.info(REDIS_INDEX).catch(() => null);
+  const info = await ftInfo(redis, REDIS_INDEX).catch(() => null);
   if (!info) {
     throw new Error(`index ${REDIS_INDEX} not found — run: npm run seed`);
   }
@@ -450,9 +521,9 @@ async function start() {
   }
   const solrBody = await solrPing.json();
 
-  console.log(`Redis index ${REDIS_INDEX}: ${Number(info.numDocs).toLocaleString()} docs`);
+  console.log(`Redis index ${REDIS_INDEX}: ${info.stats.numDocs.toLocaleString()} docs`);
   console.log(`Solr core counterparties: ${solrBody.response.numFound.toLocaleString()} docs`);
-  if (Number(info.numDocs) !== solrBody.response.numFound) {
+  if (info.stats.numDocs !== solrBody.response.numFound) {
     console.warn('WARNING: document counts differ — re-run `npm run seed` for a fair comparison');
   }
 

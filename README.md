@@ -5,8 +5,9 @@ the same laptop, over an identical 100,000-record corpus, with per-query latency
 shown live.
 
 Built for a financial-services counterparty-search conversation: fuzzy name
-matching, type-ahead, and filtered screening — the three query shapes that
-actually show up in KYC and onboarding workflows.
+matching, type-ahead, filtered screening, geo proximity, portfolio aggregation,
+identifier lookup and throughput under load — the query shapes that actually show
+up in KYC and onboarding workflows.
 
 ## Quick start
 
@@ -33,7 +34,7 @@ default 6379, so it can't collide with a Redis you already have running.
 docker compose down           # add -v to delete the volumes too
 ```
 
-## The three scenarios
+## The scenarios
 
 | Scenario | The real-world question | Redis | Solr |
 | -------- | ----------------------- | ----- | ---- |
@@ -481,3 +482,52 @@ PORT=3011 npm start
 | `Solr not reachable … is docker compose up?` | `docker compose ps` — Solr takes ~20s to become healthy on first boot. |
 | Corpus banner says **COUNTS DIFFER** | The engines hold different data; the comparison is invalid until you re-run `npm run seed`. |
 | `Port 3010 is in use` | `PORT=3011 npm start` |
+
+## Index & schema tab
+
+The eighth tab shows what actually got built on each side: the Redis index
+definition next to the Solr schema, with the field types lined up row for row so
+the mapping is readable across (`TEXT`↔`text_general`, `TAG`↔`string`,
+`NUMERIC`↔`pint`/`pdouble`/`plong`, `GEO`↔`location`).
+
+It reconstructs the `FT.CREATE` that built the index, which is the clearest
+statement of the setup difference: **one command** against a core plus a Schema
+API declaration per field. Solr carries one field Redis doesn't —
+`legal_name_sort` — which exists only because a tokenised field can't be sorted
+on.
+
+It also shows where the index memory goes, and that's worth knowing before
+quoting it:
+
+| | MB |
+| --- | -- |
+| SORTABLE copies | 43.3 |
+| inverted index | 10.8 |
+| doc table | 9.5 |
+| key table | 5.7 |
+| **total index memory** | **70.6** |
+
+**Over half the index is SORTABLE copies.** Those are what make the portfolio
+breakdown and the name sort fast — the same flags that took aggregation from
+61 ms to 6 ms — and they are not free. If someone asks what the query speed
+costs, that's the honest answer.
+
+### A node-redis parsing bug worth knowing about
+
+`client.ft.info()` in node-redis v4 uses a positional parser, and Redis 8 returns
+fields it doesn't know (`tag_overhead_sz_mb`, `text_overhead_sz_mb`,
+`total_index_memory_sz_mb`, `geoshapes_sz_mb`, `number_of_uses`, `cleaning`,
+`dialect_stats`, `Index Errors`, `field statistics`). Everything after the first
+unknown field comes back shifted. Measured against Redis 8.10.1:
+
+| field | real | `client.ft.info()` reported |
+| ----- | ---- | -------------------------- |
+| `indexing` | `0` | `5.642642021179199` |
+| `percent_indexed` | `1` | `0.6956239342689514` |
+| `hash_indexing_failures` | `0` | `20.11318016052246` |
+| `total_indexing_time` | `1155.09` | `undefined` |
+
+`num_docs` and the other early fields are fine, which is why it went unnoticed —
+the seeder's "indexing: still running" message was this, not a genuine race.
+`src/ft-info.js` reads the reply as the key/value map it actually is, so field
+order doesn't matter. Use it rather than `client.ft.info()`.

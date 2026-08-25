@@ -342,6 +342,7 @@
     <button data-s="facet">Portfolio breakdown</button>
     <button data-s="lei">Exact LEI lookup</button>
     <button data-s="throughput">Concurrent throughput</button>
+    <button data-s="index">Index &amp; schema</button>
   </div>
   <p class="hint" id="hint"></p>
   <p class="shortcuts">
@@ -592,6 +593,11 @@
       seeds: [''],
       throughput: true,
     },
+    index: {
+      hint: 'What actually got built on each side: the Redis index definition and its cost, next to the Solr schema.',
+      seeds: [''],
+      index: true,
+    },
   };
 
   // Remembers the last pick per scenario so re-entering a tab gives something
@@ -685,10 +691,14 @@
     el('facetControls').classList.toggle('show', Boolean(cfg.facet));
     el('leiControls').classList.toggle('show', Boolean(cfg.lei));
     // Free-text query, ordering and run count only apply to the live scenarios.
-    el('q').style.display = (cfg.facet || cfg.throughput) ? 'none' : '';
+    const noQuery = cfg.facet || cfg.throughput || cfg.index;
+    el('q').style.display = noQuery ? 'none' : '';
     el('order').closest('label').style.display =
-      (cfg.facet || cfg.lei || cfg.throughput) ? 'none' : '';
-    el('runs').closest('label').style.display = cfg.throughput ? 'none' : '';
+      (cfg.facet || cfg.lei || cfg.throughput || cfg.index) ? 'none' : '';
+    el('runs').closest('label').style.display =
+      (cfg.throughput || cfg.index) ? 'none' : '';
+    // The verdict label is repurposed by the index tab, so reset it here.
+    if (!cfg.index) el('verdict').querySelector('.lbl').textContent = 'faster';
 
     if (cfg.randomLei) {
       // Async, so the tab paints first and the identifier fills in.
@@ -702,6 +712,93 @@
     }
 
     search();
+  }
+
+  async function showIndexInfo() {
+    setHeaders([['Field', ''], ['Type', ''], ['Options', '']]);
+    let d;
+    try {
+      const res = await fetch('/api/index-info');
+      d = await res.json();
+      if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
+    } catch (err) {
+      el('method').innerHTML = `<b>Error:</b> ${err.message}`;
+      return;
+    }
+
+    const s = d.redis.stats;
+    el('rt').textContent = `${d.redis.fields.length} fields`;
+    el('st').textContent = `${d.solr.fields.length} fields`;
+    el('rsub').textContent =
+      `${s.numDocs.toLocaleString()} docs · ${s.numTerms.toLocaleString()} terms · ` +
+      `${s.totalIndexMemorySzMb.toFixed(1)} MB index`;
+    el('ssub').textContent = `${d.solr.docs.toLocaleString()} docs · core ${d.solr.core}`;
+    el('verdict').classList.remove('warn');
+    // The setup difference, as a number: one command against a core plus a
+    // schema declaration per field.
+    el('vx').textContent = `1 vs ${d.solr.fields.length + 1}`;
+    el('verdict').querySelector('.lbl').textContent = 'setup calls';
+
+    el('rcount').textContent = `${d.redis.keyType} · prefix ${d.redis.prefixes.join(' ')}`;
+    el('scount').textContent = `core ${d.solr.core}`;
+    el('rq').textContent = d.redis.createCommand;
+    el('sq').textContent = d.solr.setup;
+
+    const rows = (fields) => fields.map((f) => {
+      const tr = document.createElement('tr');
+      const a = document.createElement('td');
+      a.className = 'nm';
+      a.textContent = f.field;
+      const b = document.createElement('td');
+      b.textContent = f.type;
+      const c = document.createElement('td');
+      c.className = 'tag';
+      c.textContent = f.options.join(' ');
+      tr.append(a, b, c);
+      return tr;
+    });
+    el('rrows').replaceChildren(...rows(d.redis.fields));
+    el('srows').replaceChildren(...rows(d.solr.fields));
+
+    // Where the index memory actually goes.
+    const parts = [
+      ['inverted', s.invertedSzMb],
+      ['SORTABLE', s.sortableValuesSizeMb],
+      ['doc table', s.docTableSizeMb],
+      ['key table', s.keyTableSizeMb],
+    ];
+    const max = Math.max(...parts.map((p) => p[1]), 0.001);
+    el('bars').replaceChildren(...parts.map(([name, mb]) => {
+      const row = document.createElement('div');
+      row.className = 'bar-row';
+      const n = document.createElement('div');
+      n.className = 'name';
+      n.textContent = name;
+      const track = document.createElement('div');
+      track.className = 'bar-track';
+      const fill = document.createElement('div');
+      fill.className = 'bar-fill redis';
+      fill.style.width = `${Math.max((mb / max) * 100, 0.6)}%`;
+      track.append(fill);
+      const v = document.createElement('div');
+      v.className = 'val';
+      v.textContent = `${mb.toFixed(1)} MB`;
+      row.append(n, track, v);
+      return row;
+    }));
+
+    el('method').innerHTML =
+      '<b>One command builds the Redis side.</b> The index attaches to Hashes already in the ' +
+      `keyspace by key prefix (<code>${d.redis.prefixes.join(' ')}</code>) — nothing is copied into ` +
+      'it, and there is no core or collection to create first. Solr needs the core created, then ' +
+      `each field declared through the Schema API, including <code>legal_name_sort</code>, which ` +
+      'exists only because a tokenised field cannot be sorted on. ' +
+      `<b>Indexing all ${s.numDocs.toLocaleString()} documents took ` +
+      `${(s.totalIndexingTimeMs / 1000).toFixed(2)}s</b> and the index reports ` +
+      `${(s.percentIndexed * 100).toFixed(0)}% indexed with ${s.hashIndexingFailures} failures. ` +
+      `Note the memory split: <b>${s.sortableValuesSizeMb.toFixed(1)} MB of the ` +
+      `${s.totalIndexMemorySzMb.toFixed(1)} MB is SORTABLE copies</b> — those are what make the ` +
+      'portfolio breakdown and the name sort fast, and they are not free.';
   }
 
   async function showThroughput() {
@@ -910,6 +1007,12 @@
     if (cfg.throughput) {
       document.body.classList.remove('loading');
       await showThroughput();
+      return;
+    }
+
+    if (cfg.index) {
+      document.body.classList.remove('loading');
+      await showIndexInfo();
       return;
     }
 
@@ -1141,7 +1244,7 @@
 
   // ---- keyboard driving --------------------------------------------------
 
-  const SCENARIO_KEYS = ['fuzzy', 'prefix', 'filtered', 'geo', 'facet', 'lei', 'throughput'];
+  const SCENARIO_KEYS = ["fuzzy", "prefix", "filtered", "geo", "facet", "lei", "throughput", "index"];
 
   document.addEventListener('keydown', (e) => {
     // Esc always works, including from the query box, so there's a reliable way

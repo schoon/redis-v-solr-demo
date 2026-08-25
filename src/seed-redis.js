@@ -13,6 +13,7 @@ const fs = require('fs');
 const readline = require('readline');
 const { createClient, SchemaFieldTypes } = require('redis');
 const { REDIS_URL, REDIS_PREFIX, REDIS_INDEX, DATA_FILE } = require('./config');
+const { ftInfo } = require('./ft-info');
 
 const BATCH = 2000;
 
@@ -126,13 +127,19 @@ async function main() {
   // FT.INFO cp:idx — confirms how many documents the index actually holds.
   // Worth asserting rather than assuming: a silent indexing failure would
   // otherwise show up as suspiciously fast queries returning nothing.
-  const info = await client.ft.info(REDIS_INDEX);
-  const indexed = Number(info.numDocs);
+  //
+  // Read through ftInfo() rather than client.ft.info(): the client's positional
+  // parser is shifted against Redis 8's reply, and `indexing` came back as a
+  // float. That's why this used to print "still running" after it had finished.
+  const info = await ftInfo(client, REDIS_INDEX);
+  const indexed = info.stats.numDocs;
 
   console.log(`\nLoaded ${count.toLocaleString()} Hashes in ${loadMs} ms`);
   console.log(`  rate:     ${Math.round(count / (loadMs / 1000)).toLocaleString()} docs/sec`);
-  console.log(`  indexed:  ${indexed.toLocaleString()} docs (FT.INFO numDocs)`);
-  console.log(`  indexing: ${info.indexing === 0 || info.indexing === '0' ? 'complete' : 'still running'}`);
+  console.log(`  indexed:  ${indexed.toLocaleString()} docs (FT.INFO num_docs)`);
+  console.log(`  indexing: ${info.stats.indexing ? 'still running' : 'complete'} (${(info.stats.percentIndexed * 100).toFixed(0)}%)`);
+  console.log(`  index mem: ${info.stats.totalIndexMemorySzMb.toFixed(1)} MB`
+    + ` (${info.stats.sortableValuesSizeMb.toFixed(1)} MB of it SORTABLE copies)`);
 
   if (indexed !== count) {
     console.error(`\nMISMATCH: loaded ${count} but index reports ${indexed}`);
