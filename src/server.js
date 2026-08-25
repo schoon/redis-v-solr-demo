@@ -4,7 +4,23 @@ const path = require('path');
 const express = require('express');
 const { createClient } = require('redis');
 const { REDIS_URL, SOLR_URL, PORT, REDIS_INDEX } = require('./config');
-const { sanitize, redisQuery, redisSearchArgs, solrParams } = require('./queries');
+const {
+  sanitize, redisQuery, redisSearchArgs, solrParams,
+  redisAggregateArgs, solrFacetParams, redisLeiKey, solrLeiParams,
+} = require('./queries');
+
+// Financial centres offered by the geo scenario. Coordinates are [lat, lon];
+// each engine's query builder reorders as needed.
+const CENTRES = {
+  london: { label: 'London', lat: 51.5072, lon: -0.1276 },
+  'new-york': { label: 'New York', lat: 40.7128, lon: -74.006 },
+  singapore: { label: 'Singapore', lat: 1.3521, lon: 103.8198 },
+  frankfurt: { label: 'Frankfurt', lat: 50.1109, lon: 8.6821 },
+  tokyo: { label: 'Tokyo', lat: 35.6762, lon: 139.6503 },
+  zurich: { label: 'Zurich', lat: 47.3769, lon: 8.5417 },
+};
+
+const FACET_FIELDS = ['credit_rating', 'country', 'entity_type', 'sector', 'status'];
 
 const app = express();
 app.use(express.json());
@@ -55,6 +71,72 @@ async function runSolr(scenario, terms, filters, limit, order) {
   };
 }
 
+// ---- facets / aggregation -------------------------------------------------
+
+async function runRedisFacet(field, limit) {
+  const args = redisAggregateArgs(field, limit);
+  const t0 = nowMs();
+  // FT.AGGREGATE groups server-side in a single pass over the index.
+  const reply = await redis.sendCommand(args);
+  const ms = nowMs() - t0;
+
+  // RESP2 shape: [numGroups, [k, v, k, v, ...], [k, v, ...], ...]
+  const buckets = reply.slice(1).map((row) => {
+    const obj = {};
+    for (let i = 0; i < row.length; i += 2) obj[String(row[i])] = String(row[i + 1]);
+    return {
+      value: obj[field],
+      count: Number(obj.cnt),
+      exposure: Number(obj.exposure),
+    };
+  });
+  return { ms, buckets, command: args.join(' ') };
+}
+
+async function runSolrFacet(field, limit) {
+  const params = solrFacetParams(field, limit);
+  const t0 = nowMs();
+  const res = await fetch(`${SOLR_URL}/select?${params.toString()}`);
+  const body = await res.json();
+  const ms = nowMs() - t0;
+  const buckets = (body.facets?.by?.buckets || []).map((b) => ({
+    value: b.val,
+    count: b.count,
+    exposure: Number(b.exposure || 0),
+  }));
+  return { ms, qtime: body.responseHeader?.QTime, buckets, command: decodeURIComponent(params.toString()) };
+}
+
+// ---- exact LEI lookup ----------------------------------------------------
+
+async function runRedisLei(lei) {
+  const key = redisLeiKey(lei);
+  const t0 = nowMs();
+  // HGETALL cp:<LEI> — a direct key read. The search index is not involved at
+  // all, which is the point of this scenario: for known-item retrieval Redis
+  // doesn't need to search, it already knows where the record is. O(1).
+  const hash = await redis.hGetAll(key);
+  const ms = nowMs() - t0;
+  const found = Object.keys(hash).length > 0;
+  return { ms, found, doc: found ? hash : null, command: `HGETALL ${key}` };
+}
+
+async function runSolrLei(lei) {
+  const params = solrLeiParams(lei);
+  const t0 = nowMs();
+  const res = await fetch(`${SOLR_URL}/select?${params.toString()}`);
+  const body = await res.json();
+  const ms = nowMs() - t0;
+  const doc = body.response?.docs?.[0] || null;
+  return {
+    ms,
+    qtime: body.responseHeader?.QTime,
+    found: Boolean(doc),
+    doc,
+    command: decodeURIComponent(params.toString()),
+  };
+}
+
 function normalise(docs) {
   return docs.map((d) => {
     const v = d.value || {};
@@ -80,7 +162,7 @@ function normalise(docs) {
 //   &minRating=13
 //   &maxRisk=80
 app.get('/api/search', async (req, res) => {
-  const scenario = ['fuzzy', 'prefix', 'filtered'].includes(req.query.scenario)
+  const scenario = ['fuzzy', 'prefix', 'filtered', 'geo'].includes(req.query.scenario)
     ? req.query.scenario
     : 'fuzzy';
   const terms = sanitize(req.query.q);
@@ -88,18 +170,27 @@ app.get('/api/search', async (req, res) => {
   const runs = Math.min(Math.max(Number(req.query.runs) || 1, 1), 25);
   const order = req.query.order === 'relevance' ? 'relevance' : 'name';
 
+  const num = (v) => (v === '' || v === undefined ? NaN : Number(v));
+  const list = (v, re) => String(v || '').split(',').map((s) => s.trim()).filter((s) => re.test(s));
+
+  const centre = CENTRES[req.query.centre] || CENTRES.london;
+  const radiusKm = Math.min(Math.max(Number(req.query.radiusKm) || 50, 1), 5000);
+
   const filters = {
-    countries: String(req.query.countries || '')
-      .split(',')
-      .map((c) => c.trim().toUpperCase())
-      .filter((c) => /^[A-Z]{2}$/.test(c)),
+    countries: list(req.query.countries, /^[A-Z]{2}$/i).map((c) => c.toUpperCase()),
     status: /^[A-Z_]{3,12}$/.test(req.query.status || '') ? req.query.status : '',
-    minRating: req.query.minRating === '' || req.query.minRating === undefined
-      ? NaN
-      : Number(req.query.minRating),
-    maxRisk: req.query.maxRisk === '' || req.query.maxRisk === undefined
-      ? NaN
-      : Number(req.query.maxRisk),
+    entityTypes: list(req.query.entityTypes, /^[A-Z_]{3,20}$/i).map((s) => s.toUpperCase()),
+    // Sector names contain spaces, so only letters and spaces are allowed here.
+    sectors: list(req.query.sectors, /^[A-Za-z ]{3,30}$/),
+    minRating: num(req.query.minRating),
+    maxRisk: num(req.query.maxRisk),
+    minExposure: num(req.query.minExposure),
+    // "onboarded in the last N months" becomes a lower bound on the epoch
+    // timestamp — a plain numeric range on both engines, no date type needed.
+    onboardedSince: Number.isFinite(num(req.query.onboardedMonths))
+      ? Math.floor(Date.now() / 1000) - num(req.query.onboardedMonths) * 30 * 24 * 3600
+      : NaN,
+    geo: scenario === 'geo' ? { lat: centre.lat, lon: centre.lon, radiusKm } : null,
   };
 
   try {
@@ -154,6 +245,134 @@ app.get('/api/search', async (req, res) => {
     console.error('search failed:', err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// GET /api/facet?field=credit_rating&runs=5
+// Portfolio breakdown: count and total exposure per bucket.
+app.get('/api/facet', async (req, res) => {
+  const field = FACET_FIELDS.includes(req.query.field) ? req.query.field : 'credit_rating';
+  const runs = Math.min(Math.max(Number(req.query.runs) || 1, 1), 25);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 25, 1), 50);
+
+  try {
+    const rTimes = [];
+    const sTimes = [];
+    let r;
+    let s;
+    for (let i = 0; i < runs; i += 1) {
+      if (i % 2 === 0) {
+        r = await runRedisFacet(field, limit);
+        s = await runSolrFacet(field, limit);
+      } else {
+        s = await runSolrFacet(field, limit);
+        r = await runRedisFacet(field, limit);
+      }
+      rTimes.push(r.ms);
+      sTimes.push(s.ms);
+    }
+    const rMs = median(rTimes);
+    const sMs = median(sTimes);
+
+    // Buckets are compared, not just timed: if the two engines disagree on a
+    // count or a sum, the numbers on screen are not describing the same thing.
+    //
+    // Compared case-insensitively on purpose. A SORTABLE TAG field in Redis
+    // keeps a normalised (lowercased) copy, and that is what GROUPBY returns —
+    // "a+" where Solr says "A+". The grouping is identical; only the label
+    // casing differs, so the labels are shown as each engine returns them
+    // rather than being quietly rewritten. Grouping on the original casing
+    // needs LOAD, which costs roughly 3x — noted in the README.
+    const key = (v) => String(v).toLowerCase();
+    const byValue = new Map(s.buckets.map((b) => [key(b.value), b]));
+    const bucketsAgree =
+      r.buckets.length === s.buckets.length &&
+      r.buckets.every((b) => {
+        const o = byValue.get(key(b.value));
+        return o && o.count === b.count && Math.abs(o.exposure - b.exposure) < 1;
+      });
+
+    res.json({
+      field,
+      runs,
+      redis: { ms: Number(rMs.toFixed(3)), buckets: r.buckets, query: r.command },
+      solr: { ms: Number(sMs.toFixed(3)), qtime: s.qtime, buckets: s.buckets, query: s.command },
+      speedup: rMs > 0 && sMs > 0 ? Number((sMs / rMs).toFixed(1)) : null,
+      bucketsAgree,
+    });
+  } catch (err) {
+    console.error('facet failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/lei?lei=<20 chars>&runs=5
+app.get('/api/lei', async (req, res) => {
+  const lei = String(req.query.lei || '');
+  const runs = Math.min(Math.max(Number(req.query.runs) || 1, 1), 25);
+
+  try {
+    const rTimes = [];
+    const sTimes = [];
+    let r;
+    let s;
+    for (let i = 0; i < runs; i += 1) {
+      if (i % 2 === 0) {
+        r = await runRedisLei(lei);
+        s = await runSolrLei(lei);
+      } else {
+        s = await runSolrLei(lei);
+        r = await runRedisLei(lei);
+      }
+      rTimes.push(r.ms);
+      sTimes.push(s.ms);
+    }
+    const rMs = median(rTimes);
+    const sMs = median(sTimes);
+
+    res.json({
+      lei,
+      runs,
+      redis: {
+        ms: Number(rMs.toFixed(3)),
+        found: r.found,
+        name: r.doc?.legal_name || null,
+        query: r.command,
+      },
+      solr: {
+        ms: Number(sMs.toFixed(3)),
+        qtime: s.qtime,
+        found: s.found,
+        name: s.doc?.legal_name || null,
+        query: s.command,
+      },
+      speedup: rMs > 0 && sMs > 0 ? Number((sMs / rMs).toFixed(1)) : null,
+      agree: r.found === s.found && (r.doc?.legal_name || null) === (s.doc?.legal_name || null),
+    });
+  } catch (err) {
+    console.error('lei failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/sample-lei — a real identifier from the corpus, so the LEI scenario
+// has something valid to look up without the presenter copying one by hand.
+app.get('/api/sample-lei', async (req, res) => {
+  try {
+    const r = await redis.ft.search(REDIS_INDEX, '*', { LIMIT: { from: Math.floor(Math.random() * 1000), size: 1 }, RETURN: ['id', 'legal_name'] });
+    const doc = r.documents[0];
+    res.json({ lei: doc?.value?.id || null, legal_name: doc?.value?.legal_name || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/meta — filter vocabularies and geo centres, so the UI doesn't
+// hardcode lists that could drift from the data.
+app.get('/api/meta', (req, res) => {
+  res.json({
+    centres: Object.entries(CENTRES).map(([k, v]) => ({ key: k, label: v.label })),
+    facetFields: FACET_FIELDS,
+  });
 });
 
 // GET /api/stats — corpus size on both sides, so the UI can prove they match.

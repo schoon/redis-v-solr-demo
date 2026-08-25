@@ -53,6 +53,11 @@ const FIELDS = [
   { name: 'risk_score', type: 'pdouble', indexed: true, stored: true, docValues: true, multiValued: false },
   { name: 'exposure_usd', type: 'plong', indexed: true, stored: true, docValues: true, multiValued: false },
   { name: 'onboarded_at', type: 'plong', indexed: true, stored: true, docValues: true, multiValued: false },
+  // Solr's `location` type is LatLonPointSpatialField, which takes "lat,lon".
+  // Redis GEO takes "lon,lat". The seeders below write each in its own order —
+  // swapping them silently relocates every counterparty and the two engines
+  // then disagree about what's within a radius.
+  { name: 'location', type: 'location', indexed: true, stored: true, multiValued: false },
 ];
 
 async function solrPost(pathname, body) {
@@ -144,6 +149,8 @@ async function main() {
       exposure_usd: rec.exposure_usd,
       status: rec.status,
       onboarded_at: rec.onboarded_at,
+      // "lat,lon" — the order Solr expects, the reverse of Redis.
+      location: `${rec.lat},${rec.lon}`,
     });
 
     count += 1;

@@ -44,16 +44,24 @@ async function main() {
       aliases: { type: SchemaFieldTypes.TEXT, WEIGHT: 2 },
       parent_name: { type: SchemaFieldTypes.TEXT },
       city: { type: SchemaFieldTypes.TEXT },
+      // SORTABLE on the TAG fields is the counterpart to docValues:true on the
+      // Solr side. It keeps a column-oriented copy, which is what FT.AGGREGATE
+      // needs to group without loading each Hash. Every field that the facet
+      // scenario can GROUPBY gets it, so neither engine is grouping from a
+      // row store while the other reads columns.
       country: { type: SchemaFieldTypes.TAG, SORTABLE: true },
       jurisdiction: { type: SchemaFieldTypes.TAG },
-      entity_type: { type: SchemaFieldTypes.TAG },
-      sector: { type: SchemaFieldTypes.TAG },
-      credit_rating: { type: SchemaFieldTypes.TAG },
-      status: { type: SchemaFieldTypes.TAG },
+      entity_type: { type: SchemaFieldTypes.TAG, SORTABLE: true },
+      sector: { type: SchemaFieldTypes.TAG, SORTABLE: true },
+      credit_rating: { type: SchemaFieldTypes.TAG, SORTABLE: true },
+      status: { type: SchemaFieldTypes.TAG, SORTABLE: true },
       rating_score: { type: SchemaFieldTypes.NUMERIC, SORTABLE: true },
       risk_score: { type: SchemaFieldTypes.NUMERIC, SORTABLE: true },
       exposure_usd: { type: SchemaFieldTypes.NUMERIC, SORTABLE: true },
       onboarded_at: { type: SchemaFieldTypes.NUMERIC, SORTABLE: true },
+      // GEO indexes a "lon,lat" string and enables radius queries.
+      // Note the ordering — lon first. Solr's equivalent field wants lat first.
+      location: { type: SchemaFieldTypes.GEO },
     },
     { ON: 'HASH', PREFIX: REDIS_PREFIX }
   );
@@ -100,6 +108,8 @@ async function main() {
         risk_score: String(rec.risk_score),
         exposure_usd: String(rec.exposure_usd),
         onboarded_at: String(rec.onboarded_at),
+        // "lon,lat" — the order Redis GEO expects.
+        location: `${rec.lon},${rec.lat}`,
       })
     );
 

@@ -53,9 +53,12 @@ function redisQuery(scenario, terms, filters) {
     namePart = `@legal_name|aliases:(${[...head, `${last}*`].join(' ')})`;
   }
 
-  const clauses = [namePart];
+  // '*' means "everything" in Redis and cannot be combined with other clauses —
+  // `* @location:[...]` is a syntax error. So when there are no name terms, the
+  // wildcard is dropped and the filters stand alone.
+  const clauses = namePart === '*' ? [] : [namePart];
 
-  if (scenario === 'filtered') {
+  if (scenario === 'filtered' || scenario === 'geo') {
     // TAG filters use {a|b} for "any of". NUMERIC uses inclusive ranges.
     if (filters.countries?.length) {
       clauses.push(`@country:{${filters.countries.join('|')}}`);
@@ -63,15 +66,41 @@ function redisQuery(scenario, terms, filters) {
     if (filters.status) {
       clauses.push(`@status:{${filters.status}}`);
     }
+    if (filters.entityTypes?.length) {
+      clauses.push(`@entity_type:{${filters.entityTypes.join('|')}}`);
+    }
+    if (filters.sectors?.length) {
+      // Sector values contain spaces ("Asset Management"). Inside a TAG filter
+      // a bare space would end the tag, so it has to be backslash-escaped.
+      clauses.push(`@sector:{${filters.sectors.map(escapeTag).join('|')}}`);
+    }
     if (Number.isFinite(filters.minRating)) {
       clauses.push(`@rating_score:[${filters.minRating} +inf]`);
     }
     if (Number.isFinite(filters.maxRisk)) {
       clauses.push(`@risk_score:[-inf ${filters.maxRisk}]`);
     }
+    if (Number.isFinite(filters.minExposure)) {
+      clauses.push(`@exposure_usd:[${filters.minExposure} +inf]`);
+    }
+    if (Number.isFinite(filters.onboardedSince)) {
+      clauses.push(`@onboarded_at:[${filters.onboardedSince} +inf]`);
+    }
   }
 
-  return clauses.join(' ');
+  if (scenario === 'geo' && filters.geo) {
+    // @location:[<lon> <lat> <radius> <unit>] — longitude FIRST.
+    const { lon, lat, radiusKm } = filters.geo;
+    clauses.push(`@location:[${lon} ${lat} ${radiusKm} km]`);
+  }
+
+  // If nothing at all was specified, fall back to the bare wildcard.
+  return clauses.length ? clauses.join(' ') : '*';
+}
+
+// Backslash-escapes the characters that terminate a Redis TAG value.
+function escapeTag(value) {
+  return String(value).replace(/([ \-.,{}|])/g, '\\$1');
 }
 
 const REDIS_RETURN = [
@@ -150,7 +179,7 @@ function solrParams(scenario, terms, filters, limit, order = 'name') {
     params.set('q', [...head, `${last}*`].join(' '));
   }
 
-  if (scenario === 'filtered') {
+  if (scenario === 'filtered' || scenario === 'geo') {
     // Filter queries are Solr's equivalent of Redis TAG/NUMERIC clauses, and
     // they're the right tool here: cacheable and not score-affecting.
     if (filters.countries?.length) {
@@ -159,15 +188,102 @@ function solrParams(scenario, terms, filters, limit, order = 'name') {
     if (filters.status) {
       params.append('fq', `status:${filters.status}`);
     }
+    if (filters.entityTypes?.length) {
+      params.append('fq', `entity_type:(${filters.entityTypes.join(' OR ')})`);
+    }
+    if (filters.sectors?.length) {
+      // Values with spaces have to be quoted, the Solr equivalent of the
+      // backslash-escaping the Redis TAG filter needs.
+      params.append('fq', `sector:(${filters.sectors.map((s) => `"${s}"`).join(' OR ')})`);
+    }
     if (Number.isFinite(filters.minRating)) {
       params.append('fq', `rating_score:[${filters.minRating} TO *]`);
     }
     if (Number.isFinite(filters.maxRisk)) {
       params.append('fq', `risk_score:[* TO ${filters.maxRisk}]`);
     }
+    if (Number.isFinite(filters.minExposure)) {
+      params.append('fq', `exposure_usd:[${filters.minExposure} TO *]`);
+    }
+    if (Number.isFinite(filters.onboardedSince)) {
+      params.append('fq', `onboarded_at:[${filters.onboardedSince} TO *]`);
+    }
+  }
+
+  if (scenario === 'geo' && filters.geo) {
+    // geofilt takes pt=<lat>,<lon> — latitude FIRST, the reverse of Redis.
+    const { lat, lon, radiusKm } = filters.geo;
+    params.append('fq', `{!geofilt sfield=location pt=${lat},${lon} d=${radiusKm}}`);
   }
 
   return params;
 }
 
-module.exports = { sanitize, redisQuery, redisSearchArgs, solrParams, REDIS_RETURN };
+// ------------------------------------------------ facets / aggregation
+
+// Redis: FT.AGGREGATE walks the index and groups in one server-side pass.
+// Returned as raw command arguments so the exact command is displayable in the
+// UI — this is the scenario where the two engines' models differ most.
+function redisAggregateArgs(field, limit = 25) {
+  return [
+    'FT.AGGREGATE', REDIS_INDEX, '*',
+    'GROUPBY', '1', `@${field}`,
+    'REDUCE', 'COUNT', '0', 'AS', 'cnt',
+    'REDUCE', 'SUM', '1', '@exposure_usd', 'AS', 'exposure',
+    'SORTBY', '2', '@cnt', 'DESC',
+    'LIMIT', '0', String(limit),
+  ];
+}
+
+// Solr: the JSON Facet API is the like-for-like feature — terms buckets with a
+// sub-aggregation. This is territory Solr is traditionally strong in, so it's
+// worth showing rather than avoiding.
+function solrFacetParams(field, limit = 25) {
+  const params = new URLSearchParams();
+  params.set('q', '*:*');
+  params.set('rows', '0');
+  params.set('wt', 'json');
+  params.set(
+    'json.facet',
+    JSON.stringify({
+      by: {
+        type: 'terms',
+        field,
+        limit,
+        sort: { count: 'desc' },
+        facet: { exposure: 'sum(exposure_usd)' },
+      },
+    })
+  );
+  return params;
+}
+
+// ------------------------------------------------ exact LEI lookup
+
+// Structurally different rather than merely faster: the record lives at a known
+// key, so Redis reads it directly with HGETALL and never consults the index.
+// Solr has to run a query, because a document is only reachable through search.
+function redisLeiKey(lei) {
+  return `cp:${String(lei).replace(/[^A-Z0-9]/gi, '').toUpperCase()}`;
+}
+
+function solrLeiParams(lei) {
+  const params = new URLSearchParams();
+  params.set('q', `id:"${String(lei).replace(/[^A-Z0-9]/gi, '').toUpperCase()}"`);
+  params.set('rows', '1');
+  params.set('wt', 'json');
+  params.set('fl', REDIS_RETURN.join(','));
+  return params;
+}
+
+module.exports = {
+  sanitize,
+  redisQuery,
+  redisSearchArgs,
+  solrParams,
+  redisAggregateArgs,
+  solrFacetParams,
+  redisLeiKey,
+  solrLeiParams,
+  REDIS_RETURN,
+};

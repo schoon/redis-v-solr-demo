@@ -62,6 +62,17 @@ support "Lucene is slow", anything about corpora larger than RAM, anything
 distributed, or anything about relevance quality. The README's "Where this
 comparison does not apply" section is a feature — keep it current.
 
+**Solr wins the portfolio-breakdown scenario, and that stays in.** ~5.3 ms
+against Redis's ~7.5 ms grouping 100k documents by credit rating. Do not remove
+the tab, bury the number, or reconfigure it into a win. A demo that concedes the
+one scenario the competitor is better at is far more persuasive than one that
+doesn't, and a search architect will already know faceting is Solr's strength.
+
+Note what that number required: `SORTABLE` on every groupable TAG field, which
+is the counterpart to `docValues: true` in Solr. Without it Redis measured
+~61 ms — a misconfiguration on our side that would have looked like a Solr
+victory. If you add a new facet field, add `SORTABLE` too.
+
 ## Conventions
 
 **Comment the query construction.** Both engines' queries live together in
@@ -77,6 +88,23 @@ identical data. Don't introduce `Math.random()` into the generator.
 
 **Redis is on 6380.** Deliberately not 6379, so the demo can't collide with a
 Redis the presenter already has running. Don't "tidy" it back to the default.
+
+## Three silent-failure traps
+
+All three produce wrong results rather than errors, so they don't announce
+themselves.
+
+**Coordinate order is reversed.** Redis `GEO` wants `"lon,lat"`; Solr's
+`location` type wants `"lat,lon"`. The seeders each write their own order. If you
+touch either, re-run the geo scenario at several radii and confirm the counts
+still match exactly — that check is what catches a swap.
+
+**`*` can't be combined with other clauses in Redis.** `* @location:[…]` is a
+syntax error. `redisQuery()` drops the wildcard when there are no name terms.
+
+**TAG values with spaces need backslash-escaping** (`@sector:{Asset\ Management}`),
+which `escapeTag()` handles. Solr needs quoting instead. Sector values are the
+only ones with spaces today; adding another such field means using `escapeTag`.
 
 ## Redis data model
 

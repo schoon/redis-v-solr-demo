@@ -39,10 +39,19 @@ docker compose down           # add -v to delete the volumes too
 | -------- | ----------------------- | ----- | ---- |
 | **Typo-tolerant name** | "Our file says *Kestral Capitol* — who is that?" | `%term%` (Levenshtein 1) | `term~1` |
 | **Prefix / autocomplete** | An analyst typing a name, one query per keystroke | `term*` | `term*` |
-| **Filtered screening** | Name match, restricted to jurisdiction, rating and status | `TAG` + `NUMERIC` clauses | `fq` filter queries |
+| **Filtered screening** | Name match, restricted by jurisdiction, rating, type, sector, risk, exposure and onboarding date | `TAG` + `NUMERIC` clauses | `fq` filter queries |
+| **Geo proximity** | "Which counterparties are within 50km of London?" | `@location:[lon lat r km]` | `{!geofilt}` |
+| **Portfolio breakdown** | "Total exposure by credit rating" | `FT.AGGREGATE` | JSON Facet API |
+| **Exact LEI lookup** | Known-item retrieval by identifier | `HGETALL` — no index at all | `q=id:"…"` |
 
 The exact query sent to each engine is displayed under its results pane, so
 there's nothing hidden.
+
+Filtered screening exposes eight filters: country, credit rating floor, status,
+entity type, sector, risk-score ceiling, minimum exposure, and onboarding
+recency. They compose — `kes` alone matches 2,210 counterparties; adding
+`entity_type=BANK` cuts it to 229, `sector=Energy` to 14, and
+`exposure ≥ $1bn` to 10.
 
 ### Result ordering
 
@@ -82,9 +91,37 @@ Methodology.
 
 | Scenario | Redis | Solr (wall) | Solr (QTime) | Ratio |
 | -------- | ----- | ----------- | ------------ | ----- |
-| Typo-tolerant | ~1.0 ms | ~4.3 ms | ~0 ms | ~4× |
-| Prefix | ~0.9 ms | ~3.5 ms | ~0 ms | ~4× |
-| Filtered | ~1.3 ms | ~4.2 ms | ~0 ms | ~3× |
+| Typo-tolerant | ~1.2 ms | ~3.5 ms | ~0 ms | ~2.9× |
+| Prefix | ~1.6 ms | ~3.1 ms | ~0 ms | ~2× |
+| Filtered (8 filters) | ~0.8 ms | ~2.9 ms | ~0 ms | ~3.7× |
+| Geo, 50km radius | ~2.1 ms | ~3.1 ms | ~0 ms | ~1.4× |
+| Exact LEI (`HGETALL`) | ~0.3 ms | ~2.1 ms | ~0 ms | ~7.7× |
+| **Portfolio breakdown** | **~7.5 ms** | **~5.3 ms** | ~2 ms | **0.7× — Solr wins** |
+
+### Solr wins the aggregation scenario
+
+That last row is not a mistake and it is not there for balance. Grouping 100,000
+documents by credit rating and summing exposure takes Redis ~7.5 ms and Solr
+~5.3 ms. On `sector` the gap is wider: ~6.8 ms against ~4.2 ms. The counts and
+sums are identical, so it's a like-for-like comparison — Solr is simply faster
+here, and its JSON Facet API over column-oriented docValues is very good at
+exactly this shape of work.
+
+Two things worth knowing about that number:
+
+- **It was much worse before a fairness fix.** Redis first measured ~61 ms,
+  because only `country` had `SORTABLE` on it. `SORTABLE` is the counterpart to
+  Solr's `docValues: true` — without it, `FT.AGGREGATE` loads each Hash instead
+  of reading a column. With `SORTABLE` on every groupable TAG field, Redis went
+  from 61 ms to ~7.5 ms. Solr still wins, but 61 ms would have been a
+  misconfiguration on our side presented as a Solr victory.
+- **Redis returns lowercase bucket labels** (`a+`, not `A+`) because grouping on
+  a `SORTABLE` tag reads the normalised copy. The UI shows each engine's labels
+  as returned rather than rewriting them. Preserving the original casing needs
+  `LOAD`, which measured roughly 3× slower.
+
+Lead with latency, and if a customer asks about faceting, show them this tab and
+say Solr is stronger at it. That answer buys credibility for the rest.
 
 Indexing the same 100k records:
 
@@ -111,8 +148,11 @@ code is short enough to audit. A rigged benchmark is worse than no benchmark.
   pays for a network hop the other doesn't.
 - **Equivalent schemas.** Fields are declared explicitly on both sides, not left
   to dynamic-field or schemaless inference. `TEXT`↔`text_general`,
-  `TAG`↔`string` with docValues, `NUMERIC`↔`pint`/`pdouble`/`plong`. Name-field
-  boosts are 5 and 2 on both.
+  `TAG`↔`string` with docValues, `NUMERIC`↔`pint`/`pdouble`/`plong`,
+  `GEO`↔`location`. Name-field boosts are 5 and 2 on both. Every TAG field the
+  breakdown can group by carries `SORTABLE`, matching `docValues: true` on the
+  Solr side, so neither engine groups from a row store while the other reads
+  columns.
 - **Equivalent boolean semantics.** Solr gets `mm=100%` so every term is
   mandatory, matching Redis's default term intersection. This mattered: without
   it, `kestral capitol` returned **158** documents from Redis and **8,662** from
@@ -168,6 +208,26 @@ consequences — and it is not the same claim as "Lucene is slow."
 
 If a customer pushes on any of those, the honest answer is that this demo
 doesn't cover it.
+
+## Three gotchas worth knowing if you extend this
+
+These cost real debugging time while building the demo, and all three produce
+silently wrong results rather than errors.
+
+**Coordinate order is reversed between the engines.** Redis `GEO` takes
+`"lon,lat"`; Solr's `LatLonPointSpatialField` takes `"lat,lon"`. Get it backwards
+and London lands in the Indian Ocean — no error, just a radius query that
+quietly disagrees. The seeders write each in its own order, and the geo scenario
+is verified to return identical counts at 10 km, 50 km and 200 km.
+
+**`*` cannot be combined with other clauses in Redis.** `* @location:[…]` is a
+syntax error, so with no name terms the wildcard is dropped and the filters
+stand alone. Solr's `q=*:*` composes with `fq` happily, which is why this only
+broke one side.
+
+**TAG values containing spaces need escaping.** `@sector:{Asset Management}`
+silently truncates at the space; it has to be `@sector:{Asset\ Management}`.
+Solr's equivalent is quoting: `sector:("Asset Management")`.
 
 ## Data model
 

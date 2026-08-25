@@ -121,6 +121,9 @@
     <button data-s="fuzzy" class="active">Typo-tolerant name</button>
     <button data-s="prefix">Prefix / autocomplete</button>
     <button data-s="filtered">Filtered screening</button>
+    <button data-s="geo">Geo proximity</button>
+    <button data-s="facet">Portfolio breakdown</button>
+    <button data-s="lei">Exact LEI lookup</button>
   </div>
   <p class="hint" id="hint"></p>
 
@@ -151,6 +154,7 @@
         <option value="JP">JP</option>
         <option value="SG">SG</option>
         <option value="CH">CH</option>
+        <option value="KY">KY</option>
       </select>
     </label>
     <label class="inline">rating ≥
@@ -171,6 +175,89 @@
         <option value="TERMINATED">TERMINATED</option>
       </select>
     </label>
+    <label class="inline">type
+      <select id="entityTypes" multiple size="1" style="min-width:8rem">
+        <option value="BANK">BANK</option>
+        <option value="BROKER_DEALER">BROKER_DEALER</option>
+        <option value="ASSET_MANAGER">ASSET_MANAGER</option>
+        <option value="HEDGE_FUND">HEDGE_FUND</option>
+        <option value="INSURER">INSURER</option>
+        <option value="PENSION_FUND">PENSION_FUND</option>
+        <option value="SPV">SPV</option>
+        <option value="CORPORATE">CORPORATE</option>
+        <option value="CCP">CCP</option>
+        <option value="SOVEREIGN">SOVEREIGN</option>
+      </select>
+    </label>
+    <label class="inline">sector
+      <select id="sectors" multiple size="1" style="min-width:8rem">
+        <option value="Banking">Banking</option>
+        <option value="Insurance">Insurance</option>
+        <option value="Asset Management">Asset Management</option>
+        <option value="Energy">Energy</option>
+        <option value="Utilities">Utilities</option>
+        <option value="Technology">Technology</option>
+        <option value="Real Estate">Real Estate</option>
+        <option value="Sovereign">Sovereign</option>
+        <option value="Mining">Mining</option>
+      </select>
+    </label>
+    <label class="inline">risk ≤
+      <select id="maxRisk">
+        <option value="">any</option>
+        <option value="20">20</option>
+        <option value="40">40</option>
+        <option value="60">60</option>
+        <option value="80">80</option>
+      </select>
+    </label>
+    <label class="inline">exposure ≥
+      <select id="minExposure">
+        <option value="">any</option>
+        <option value="100000000">$100m</option>
+        <option value="500000000">$500m</option>
+        <option value="1000000000">$1bn</option>
+        <option value="2500000000">$2.5bn</option>
+      </select>
+    </label>
+    <label class="inline">onboarded
+      <select id="onboardedMonths">
+        <option value="">any time</option>
+        <option value="12">last 12 months</option>
+        <option value="24">last 24 months</option>
+        <option value="60">last 5 years</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="filters" id="geoControls">
+    <label class="inline">near
+      <select id="centre"></select>
+    </label>
+    <label class="inline">within
+      <select id="radiusKm">
+        <option value="10">10 km</option>
+        <option value="50" selected>50 km</option>
+        <option value="200">200 km</option>
+        <option value="1000">1000 km</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="filters" id="facetControls">
+    <label class="inline">group by
+      <select id="facetField">
+        <option value="credit_rating" selected>credit_rating</option>
+        <option value="country">country</option>
+        <option value="entity_type">entity_type</option>
+        <option value="sector">sector</option>
+        <option value="status">status</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="filters" id="leiControls">
+    <button id="sampleLei" type="button">Pick a random LEI from the corpus</button>
   </div>
 
   <div class="summary">
@@ -234,6 +321,24 @@
       seed: 'kes',
       filters: true,
     },
+    geo: {
+      hint: 'Counterparties within a radius of a financial centre. Redis GEO takes lon,lat; Solr geofilt takes lat,lon — reversed.',
+      placeholder: 'optional name filter',
+      seed: '',
+      filters: true,
+      geo: true,
+    },
+    facet: {
+      hint: 'Portfolio breakdown: count and total exposure per bucket. Redis FT.AGGREGATE vs Solr JSON Facet API — the one scenario where Solr wins.',
+      seed: '',
+      facet: true,
+    },
+    lei: {
+      hint: 'Known-item retrieval. Redis reads the key directly with HGETALL and never touches the index; Solr must run a query.',
+      placeholder: '20-character LEI',
+      seed: '',
+      lei: true,
+    },
   };
 
   let scenario = 'fuzzy';
@@ -250,10 +355,59 @@
     for (const b of el('scenarios').children) b.classList.toggle('active', b.dataset.s === next);
     const cfg = SCENARIOS[next];
     el('hint').textContent = cfg.hint;
-    el('q').placeholder = cfg.placeholder;
+    el('q').placeholder = cfg.placeholder || '';
     el('q').value = cfg.seed;
-    el('filters').classList.toggle('show', cfg.filters);
+    el('filters').classList.toggle('show', Boolean(cfg.filters));
+    el('geoControls').classList.toggle('show', Boolean(cfg.geo));
+    el('facetControls').classList.toggle('show', Boolean(cfg.facet));
+    el('leiControls').classList.toggle('show', Boolean(cfg.lei));
+    // The facet scenario has no free-text query, and ordering doesn't apply.
+    el('q').style.display = cfg.facet ? 'none' : '';
+    el('order').closest('label').style.display = (cfg.facet || cfg.lei) ? 'none' : '';
     search();
+  }
+
+  // Renders the aggregation buckets in place of the results table.
+  function renderBuckets(tbody, buckets) {
+    if (!buckets.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="empty">No buckets</td></tr>';
+      return;
+    }
+    tbody.replaceChildren(...buckets.map((b) => {
+      const tr = document.createElement('tr');
+      const v = document.createElement('td');
+      const strong = document.createElement('div');
+      strong.className = 'nm';
+      // Shown exactly as each engine returns it. Redis lowercases SORTABLE tag
+      // values, so its labels differ in case from Solr's — that is real
+      // behaviour, not a rendering bug, and the note below explains it.
+      strong.textContent = b.value;
+      v.append(strong);
+      const c = document.createElement('td');
+      c.className = 'num';
+      c.textContent = b.count.toLocaleString();
+      const e = document.createElement('td');
+      e.className = 'num';
+      e.colSpan = 2;
+      e.textContent = `$${(b.exposure / 1e9).toFixed(1)}bn`;
+      tr.append(v, c, e);
+      return tr;
+    }));
+  }
+
+  function setHeaders(cols) {
+    for (const side of ['r', 's']) {
+      const thead = el(`${side}rows`).previousElementSibling;
+      thead.replaceChildren(...[document.createElement('tr')].map((tr) => {
+        for (const [label, cls] of cols) {
+          const th = document.createElement('th');
+          th.textContent = label;
+          if (cls) th.className = cls;
+          tr.append(th);
+        }
+        return tr;
+      }));
+    }
   }
 
   function renderRows(tbody, hits) {
@@ -317,32 +471,128 @@
     }));
   }
 
+  function multi(id) {
+    return Array.from(el(id).selectedOptions).map((o) => o.value);
+  }
+
   async function search() {
-    const params = new URLSearchParams({
-      scenario,
-      q: el('q').value,
-      runs: el('runs').value,
-      order: el('order').value,
-      limit: '10',
-    });
-    if (SCENARIOS[scenario].filters) {
-      params.set('countries', selectedCountries().join(','));
-      params.set('minRating', el('minRating').value);
-      params.set('status', el('status').value);
+    const cfg = SCENARIOS[scenario];
+    const seq = ++inflight;
+    let url;
+
+    if (cfg.facet) {
+      url = `/api/facet?field=${el('facetField').value}&runs=${el('runs').value}`;
+    } else if (cfg.lei) {
+      url = `/api/lei?lei=${encodeURIComponent(el('q').value.trim())}&runs=${el('runs').value}`;
+    } else {
+      const params = new URLSearchParams({
+        scenario,
+        q: el('q').value,
+        runs: el('runs').value,
+        order: el('order').value,
+        limit: '10',
+      });
+      if (cfg.filters) {
+        params.set('countries', selectedCountries().join(','));
+        params.set('minRating', el('minRating').value);
+        params.set('status', el('status').value);
+        params.set('entityTypes', multi('entityTypes').join(','));
+        params.set('sectors', multi('sectors').join(','));
+        params.set('maxRisk', el('maxRisk').value);
+        params.set('minExposure', el('minExposure').value);
+        params.set('onboardedMonths', el('onboardedMonths').value);
+      }
+      if (cfg.geo) {
+        params.set('centre', el('centre').value);
+        params.set('radiusKm', el('radiusKm').value);
+      }
+      url = `/api/search?${params}`;
     }
 
-    const seq = ++inflight;
     let d;
     try {
-      const res = await fetch(`/api/search?${params}`);
+      const res = await fetch(url);
       d = await res.json();
       if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
     } catch (err) {
       el('method').innerHTML = `<b>Error:</b> ${err.message}`;
       return;
     }
-    // A slower earlier keystroke must not overwrite a newer result.
     if (seq !== inflight) return;
+
+    // ---- facet and LEI have their own shapes; handle and return early.
+    if (cfg.facet) {
+      setHeaders([['Bucket', ''], ['Count', 'num'], ['Exposure', 'num']]);
+      el('rt').textContent = `${d.redis.ms.toFixed(2)} ms`;
+      el('st').textContent = `${d.solr.ms.toFixed(2)} ms`;
+      el('rsub').textContent = `median of ${d.runs} · ${d.redis.buckets.length} buckets`;
+      el('ssub').textContent = `median of ${d.runs} · QTime ${d.solr.qtime} ms · ${d.solr.buckets.length} buckets`;
+      const v = el('verdict');
+      v.classList.toggle('warn', !d.bucketsAgree);
+      el('vx').textContent = d.bucketsAgree
+        ? (d.speedup >= 1 ? `${d.speedup}×` : `Solr ${(1 / d.speedup).toFixed(1)}× faster`)
+        : 'buckets differ';
+      el('rcount').textContent = `${d.redis.buckets.length} buckets`;
+      el('scount').textContent = `${d.solr.buckets.length} buckets`;
+      el('rq').textContent = d.redis.query;
+      el('sq').textContent = d.solr.query;
+      renderBuckets(el('rrows'), d.redis.buckets);
+      renderBuckets(el('srows'), d.solr.buckets);
+      renderBars(d.redis.ms, d.solr.ms, d.solr.qtime);
+      el('method').innerHTML =
+        '<b>Aggregation is the scenario Solr usually wins,</b> and it is included for that reason. ' +
+        'Redis groups with FT.AGGREGATE; Solr uses the JSON Facet API over docValues, which is ' +
+        'column-oriented and very good at exactly this. The counts and sums are compared, not just ' +
+        'the timings — if they diverged the numbers would be describing different questions. ' +
+        'Redis labels are lowercase because grouping on a SORTABLE tag returns the normalised copy; ' +
+        'preserving the original casing needs LOAD, which costs roughly 3×. ' +
+        'Redis TAG fields carry SORTABLE here so both engines group from a column store rather ' +
+        'than one of them reading whole records.';
+      return;
+    }
+
+    if (cfg.lei) {
+      setHeaders([['Field', ''], ['Value', '']]);
+      el('rt').textContent = `${d.redis.ms.toFixed(3)} ms`;
+      el('st').textContent = `${d.solr.ms.toFixed(3)} ms`;
+      el('rsub').textContent = `median of ${d.runs} · ${d.redis.found ? 'found' : 'not found'}`;
+      el('ssub').textContent = `median of ${d.runs} · QTime ${d.solr.qtime} ms · ${d.solr.found ? 'found' : 'not found'}`;
+      const v = el('verdict');
+      v.classList.toggle('warn', !d.agree);
+      el('vx').textContent = d.agree ? `${d.speedup}×` : 'engines disagree';
+      el('rcount').textContent = d.redis.found ? 'hit' : 'miss';
+      el('scount').textContent = d.solr.found ? 'hit' : 'miss';
+      el('rq').textContent = d.redis.query;
+      el('sq').textContent = d.solr.query;
+      const rowsFor = (name) => name
+        ? [['legal_name', name]]
+        : [['result', 'no such LEI in the corpus']];
+      for (const [tbodyId, name] of [['rrows', d.redis.name], ['srows', d.solr.name]]) {
+        el(tbodyId).replaceChildren(...rowsFor(name).map(([k, val]) => {
+          const tr = document.createElement('tr');
+          const a = document.createElement('td');
+          a.className = 'tag';
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.className = 'nm';
+          b.textContent = val;
+          tr.append(a, b);
+          return tr;
+        }));
+      }
+      renderBars(d.redis.ms, d.solr.ms, d.solr.qtime);
+      el('method').innerHTML =
+        '<b>This one is a structural difference, not just a faster index.</b> The record lives at a ' +
+        'known key, so Redis reads it with HGETALL and never consults the search index at all — O(1). ' +
+        'Solr has no equivalent path: a document is only reachable through a query, because search ' +
+        'is the only way in. For counterparty systems that matters, since most production lookups ' +
+        'are by identifier rather than by name.';
+      return;
+    }
+
+    // The stale-response guard now lives right after the fetch, above, so it
+    // covers the facet and LEI paths too.
+    setHeaders([['Counterparty', ''], ['Ctry', ''], ['Rating', ''], ['Risk', 'num']]);
 
     el('rt').textContent = `${d.redis.ms.toFixed(2)} ms`;
     el('st').textContent = `${d.solr.ms.toFixed(2)} ms`;
@@ -401,14 +651,31 @@
   });
   el('runs').addEventListener('change', search);
   el('order').addEventListener('change', search);
-  for (const id of ['countries', 'minRating', 'status']) {
+  for (const id of ['countries', 'minRating', 'status', 'entityTypes', 'sectors',
+    'maxRisk', 'minExposure', 'onboardedMonths', 'centre', 'radiusKm', 'facetField']) {
     el(id).addEventListener('change', search);
   }
+  el('sampleLei').addEventListener('click', async () => {
+    const s = await (await fetch('/api/sample-lei')).json();
+    if (s.lei) { el('q').value = s.lei; search(); }
+  });
   el('scenarios').addEventListener('click', (e) => {
     if (e.target.dataset.s) setScenario(e.target.dataset.s);
   });
 
   (async () => {
+    try {
+      // Geo centres come from the server so the dropdown can't drift from the
+      // coordinates the queries actually use.
+      const meta = await (await fetch('/api/meta')).json();
+      el('centre').replaceChildren(...meta.centres.map((c) => {
+        const o = document.createElement('option');
+        o.value = c.key;
+        o.textContent = c.label;
+        return o;
+      }));
+    } catch { /* dropdown stays empty; the server defaults to London */ }
+
     try {
       const s = await (await fetch('/api/stats')).json();
       const match = s.redis.docs === s.solr.docs;
