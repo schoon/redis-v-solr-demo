@@ -262,6 +262,11 @@
       font-size: 0.95em; color: #c9cdd6;
     }
     .present-btn { font-size: 0.78rem; padding: 0.3rem 0.6rem; }
+    /* Engaged state, so the label can stay constant. */
+    .present-btn.on {
+      background: #2f3644; color: #fff; border-color: #4a5262; font-weight: 550;
+    }
+    .present-btn.on::before { content: '● '; color: var(--good); font-size: 0.7em; }
   </style>
 </head>
 <body>
@@ -270,7 +275,7 @@
     <h1>Counterparty Search</h1>
     <span class="corpus" id="corpus">checking corpus…</span>
     <a href="#" id="backToOverview" class="overview-link" hidden>← overview</a>
-    <button id="presentBtn" class="present-btn" hidden>Aa presentation</button>
+    <button id="presentBtn" class="present-btn" aria-pressed="false" hidden>Aa presentation mode</button>
   </header>
 
   <!-- Landing view. Shown first so a room gets the premise, the method and the
@@ -1115,9 +1120,19 @@
 
   // Scales the root font size, so the whole UI grows proportionally. Persisted,
   // because a presenter shouldn't have to re-enable it after every reload.
+  //
+  // The label always names the feature and the button's highlight shows whether
+  // it's engaged. An earlier version swapped the text to the state it would
+  // switch to ("Aa laptop" while presentation mode was on), which read as a
+  // label for the current state and was genuinely confusing.
   function setPresent(on) {
     document.documentElement.classList.toggle('present', on);
-    el('presentBtn').textContent = on ? 'Aa laptop' : 'Aa presentation';
+    const btn = el('presentBtn');
+    btn.classList.toggle('on', on);
+    btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    btn.title = on
+      ? 'Presentation mode is on — click or press P for laptop size'
+      : 'Scale the whole UI up for a projector — or press P';
     try { localStorage.setItem('rvs-present', on ? '1' : '0'); } catch { /* private mode */ }
   }
   el('presentBtn').addEventListener('click', () => {
