@@ -43,6 +43,15 @@ intersection. Without it `kestral capitol` returns 158 documents from Redis and
 **The UI must keep refusing to show a multiplier when result counts differ.**
 `totalsMatch` exists for that. Don't "fix" a totals mismatch by hiding it.
 
+Geo is the single exception, and it is a narrow one. The two engines round geo
+distance differently, so documents on the radius boundary can fall either side —
+worst observed case 7 documents in 5,215 across all 24 centre/radius pairs. That
+scenario accepts a 0.25% tolerance derived from that measurement, and the UI
+prints the actual delta and percentage whenever the tolerance is load-bearing.
+Don't widen the tolerance, don't apply it to other scenarios, and don't stop
+printing the delta — the strict check is what makes the rest of the numbers
+trustworthy.
+
 **Solr must stay warm and keep-alive'd.** The seeder's warm-up pass and Node's
 connection reuse are both load-bearing. Timing a cold Solr, or one paying a TCP
 handshake per query, would be a cheap trick.

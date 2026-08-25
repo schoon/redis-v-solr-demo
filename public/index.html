@@ -523,49 +523,86 @@
 </div>
 
 <script>
+  // Each scenario carries a pool of queries rather than one fixed seed, and a
+  // fresh one is drawn every time you enter the tab. A demo that always runs
+  // the same string invites the suspicion that the string was chosen to win.
+  //
+  // Every entry in these pools is verified to return hits on both engines —
+  // a random query that lands on zero results is worse than a canned one.
   const SCENARIOS = {
     fuzzy: {
       hint: 'Levenshtein distance 1 on both sides — Redis %term%, Solr term~1. Try a misspelling.',
-      placeholder: 'kestral capitol',
-      seed: 'kestral capitol',
+      placeholder: 'a misspelled name',
+      seeds: [
+        'kestral capitol', 'invermer finacial', 'stonebrige treasery',
+        'aberdare advisry', 'blackfriers securites', 'harowgate holdings',
+        'pemberton advisery', 'ravenswod trust', 'lansdowne clering',
+        // 'westbrooke' is an insertion, so distance 1. 'westbroke' would be a
+        // transposition of the last two letters — distance 2 under plain
+        // Levenshtein, which both %term% and ~1 reject, and it returned zero
+        // hits on both engines.
+        'thorndyke partners', 'westbrooke capitol', 'ironbrige credit',
+      ],
       filters: false,
     },
     prefix: {
       hint: 'Wildcard on the final term as you type — one query per keystroke, on both engines.',
-      placeholder: 'kes',
-      seed: 'stonebr',
+      placeholder: 'start typing a name',
+      seeds: ['kes', 'stonebr', 'aber', 'blackf', 'harrow', 'lansd', 'ravens',
+        'thornd', 'westbr', 'ironbr', 'pemb', 'moorg', 'saltm', 'greyf'],
       filters: false,
     },
     filtered: {
       hint: 'Name prefix plus screening filters — Redis TAG/NUMERIC clauses, Solr fq params.',
-      placeholder: 'kes',
-      seed: 'kes',
+      seeds: ['kes', 'aber', 'stone', 'black', 'harrow', 'lans', 'raven',
+        'thorn', 'west', 'iron', 'pemb', 'moor'],
       filters: true,
     },
     geo: {
       hint: 'Counterparties within a radius of a financial centre. Redis GEO takes lon,lat; Solr geofilt takes lat,lon — reversed.',
       placeholder: 'optional name filter',
-      seed: '',
+      seeds: [''],
       filters: true,
       geo: true,
+      // The centre and radius are the query here, so those get randomised.
+      randomGeo: true,
     },
     facet: {
       hint: 'Portfolio breakdown: count and total exposure per bucket. Redis FT.AGGREGATE vs Solr JSON Facet API — the one scenario where Solr wins.',
-      seed: '',
+      seeds: [''],
       facet: true,
+      randomFacetField: true,
     },
     lei: {
       hint: 'Known-item retrieval. Redis reads the key directly with HGETALL and never touches the index; Solr must run a query.',
       placeholder: '20-character LEI',
-      seed: '',
+      seeds: [''],
       lei: true,
+      // Pulls a real identifier from the corpus on entry, so the tab shows a
+      // result immediately instead of opening empty.
+      randomLei: true,
     },
     throughput: {
       hint: 'QPS and tail latency under concurrent load. Measured by `npm run bench`, not from this page — driving load from the web server would skew its own numbers.',
-      seed: '',
+      seeds: [''],
       throughput: true,
     },
   };
+
+  // Remembers the last pick per scenario so re-entering a tab gives something
+  // different rather than the same query twice in a row.
+  const lastPick = {};
+
+  function pickFrom(list, key) {
+    if (!list || list.length === 0) return '';
+    if (list.length === 1) return list[0];
+    let v;
+    do {
+      v = list[Math.floor(Math.random() * list.length)];
+    } while (v === lastPick[key] && list.length > 1);
+    lastPick[key] = v;
+    return v;
+  }
 
   let scenario = 'fuzzy';
   let inflight = 0;
@@ -623,7 +660,21 @@
     const cfg = SCENARIOS[next];
     el('hint').textContent = cfg.hint;
     el('q').placeholder = cfg.placeholder || '';
-    el('q').value = cfg.seed;
+    el('q').value = pickFrom(cfg.seeds, next);
+
+    // Randomise whatever *is* the query for this scenario. Filter chips are
+    // left alone on purpose — if a presenter has set them deliberately, having
+    // them reshuffle on every tab switch would fight them.
+    if (cfg.randomGeo) {
+      const centres = Array.from(el('centre').options).map((o) => o.value);
+      if (centres.length) el('centre').value = pickFrom(centres, 'centre');
+      const radii = Array.from(el('radiusKm').options).map((o) => o.value);
+      el('radiusKm').value = pickFrom(radii, 'radius');
+    }
+    if (cfg.randomFacetField) {
+      const fields = Array.from(el('facetField').options).map((o) => o.value);
+      el('facetField').value = pickFrom(fields, 'facetField');
+    }
     el('filters').classList.toggle('show', Boolean(cfg.filters));
     el('geoControls').classList.toggle('show', Boolean(cfg.geo));
     el('facetControls').classList.toggle('show', Boolean(cfg.facet));
@@ -633,6 +684,18 @@
     el('order').closest('label').style.display =
       (cfg.facet || cfg.lei || cfg.throughput) ? 'none' : '';
     el('runs').closest('label').style.display = cfg.throughput ? 'none' : '';
+
+    if (cfg.randomLei) {
+      // Async, so the tab paints first and the identifier fills in.
+      fetch('/api/sample-lei')
+        .then((r) => r.json())
+        .then((s) => {
+          if (s.lei && scenario === 'lei') { el('q').value = s.lei; search(); }
+        })
+        .catch(() => { /* leave the box empty; the button still works */ });
+      return;
+    }
+
     search();
   }
 
@@ -974,15 +1037,25 @@
     el('ssub').textContent =
       `median of ${d.runs} · QTime ${d.solr.qtime} ms · ${d.solr.total.toLocaleString()} matches`;
 
+    // Refuse to show a multiplier when the engines matched different numbers of
+    // documents — that would be comparing two different queries. Geo is the
+    // exception: a handful of documents on the radius boundary can fall either
+    // side because the two engines round geo distance differently, so a 0.1%
+    // tolerance applies there and the discrepancy is stated rather than hidden.
     const verdict = el('verdict');
-    if (!d.totalsMatch) {
-      // Refuse to show a multiplier when the engines matched different
-      // numbers of documents — that would be comparing two different queries.
-      verdict.classList.add('warn');
-      el('vx').textContent = 'totals differ';
-    } else {
-      verdict.classList.remove('warn');
-      el('vx').textContent = `${d.speedup}×`;
+    const acceptable = d.totalsMatch || (scenario === 'geo' && d.totalsClose);
+    verdict.classList.toggle('warn', !acceptable);
+    el('vx').textContent = acceptable ? `${d.speedup}×` : 'totals differ';
+
+    let geoNote = '';
+    if (scenario === 'geo' && !d.totalsMatch && d.totalsClose) {
+      geoNote =
+        `<b>Counts differ by ${d.totalsDelta} document${d.totalsDelta === 1 ? '' : 's'}</b> ` +
+        `(${((d.totalsDelta / Math.max(d.redis.total, 1)) * 100).toFixed(3)}%). ` +
+        'Redis GEO and Solr’s LatLonPointSpatialField use different earth models and coordinate ' +
+        'quantisation, so a document sitting essentially on the radius boundary can fall inside ' +
+        'for one engine and outside for the other. That is edge rounding, not a disagreement ' +
+        'about the question. ';
     }
 
     el('rcount').textContent = `${d.redis.total.toLocaleString()} matches`;
@@ -1006,6 +1079,7 @@
         'comparison. ';
 
     el('method').innerHTML =
+      geoNote +
       orderNote +
       '<b>How this is measured.</b> Both engines run the same query the same number of times, ' +
       'alternating which goes first, and the <b>median</b> is reported — not the best case. ' +

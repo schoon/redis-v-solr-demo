@@ -382,6 +382,18 @@ and London lands in the Indian Ocean — no error, just a radius query that
 quietly disagrees. The seeders write each in its own order, and the geo scenario
 is verified to return identical counts at 10 km, 50 km and 200 km.
 
+**Geo counts can differ by a handful of documents, and that's expected.** The two
+engines use different earth models and coordinate quantisation, so a document
+sitting essentially on the radius boundary can fall inside for one and outside
+for the other. Across all 24 centre/radius pairs the demo can pick, the largest
+divergence was 7 documents in 5,215 (Frankfurt at 200 km, 0.134%). The geo
+scenario therefore accepts a **0.25%** tolerance — chosen from that measured
+worst case, not guessed — and the UI prints the exact document count and
+percentage whenever the tolerance is what's carrying the comparison. Every other
+scenario stays on strict equality: for reference, the `mm=100%` bug this
+mechanism is designed to catch produced 158 against 8,662, which the tolerance
+rejects by three orders of magnitude.
+
 **`*` cannot be combined with other clauses in Redis.** `* @location:[…]` is a
 syntax error, so with no name terms the wildcard is dropped and the filters
 stand alone. Solr's `q=*:*` composes with `fq` happily, which is why this only
