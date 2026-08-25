@@ -89,6 +89,28 @@ identical data. Don't introduce `Math.random()` into the generator.
 **Redis is on 6380.** Deliberately not 6379, so the demo can't collide with a
 Redis the presenter already has running. Don't "tidy" it back to the default.
 
+## The throughput benchmark
+
+`src/bench.js`, run via `npm run bench`. Four things about it are load-bearing;
+don't undo them.
+
+**It stays a CLI tool.** Driving load from inside the web server would have the
+load generator competing with the process being measured. The UI reads the
+results file instead.
+
+**worker_threads, not one event loop.** A single-threaded client saturates before
+Redis does and you end up benchmarking Node's JSON parsing rather than either
+engine.
+
+**Engines are loaded sequentially.** Never add a "run both at once" mode — on one
+host they'd compete for cores and both numbers would be meaningless.
+
+**Client CPU is measured in the main thread only.** `process.cpuUsage()` inside a
+worker reports the whole process, so summing it per worker inflates it by the
+worker count (this bug initially reported 101 CPU-seconds per wall-second on a
+14-core box). If the client saturates, the QPS figure is a client limit and the
+tool must keep saying so.
+
 ## Three silent-failure traps
 
 All three produce wrong results rather than errors, so they don't announce

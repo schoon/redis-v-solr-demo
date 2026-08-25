@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('path');
+const fs = require('fs');
 const express = require('express');
 const { createClient } = require('redis');
 const { REDIS_URL, SOLR_URL, PORT, REDIS_INDEX } = require('./config');
@@ -361,6 +362,23 @@ app.get('/api/sample-lei', async (req, res) => {
     const r = await redis.ft.search(REDIS_INDEX, '*', { LIMIT: { from: Math.floor(Math.random() * 1000), size: 1 }, RETURN: ['id', 'legal_name'] });
     const doc = r.documents[0];
     res.json({ lei: doc?.value?.id || null, legal_name: doc?.value?.legal_name || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/bench-results — the last `npm run bench` run.
+//
+// Read from a file rather than generated on demand: driving a load test from
+// inside this process would have the load generator competing with the server
+// being measured. See src/bench.js.
+app.get('/api/bench-results', (req, res) => {
+  const file = path.join(__dirname, '..', 'data', 'bench-results.json');
+  try {
+    if (!fs.existsSync(file)) {
+      return res.status(404).json({ error: 'no benchmark results yet — run: npm run bench' });
+    }
+    res.json(JSON.parse(fs.readFileSync(file, 'utf8')));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -113,6 +113,66 @@ needed it, so the container reports ~2.3 GB regardless of corpus size. Don't
 quote memory at 100k from this configuration — Solr would run comfortably in far
 less. Redis sits at ~245 MB.
 
+## Concurrent throughput
+
+`npm run bench` loads both engines under concurrency and reports QPS with tail
+latency. It's a CLI tool rather than a button in the UI on purpose: driving load
+from the same Node process that serves the page would have the load generator
+competing with the thing being measured. The **Concurrent throughput** tab
+displays the last run.
+
+```bash
+npm run bench                                          # prefix, 16 threads, 10s
+npm run bench -- --scenario=filtered --concurrency=32
+npm run bench -- --scenario=lei --duration=30
+```
+
+100k corpus, 14-core host, each engine loaded separately:
+
+| Concurrency | Redis QPS | Solr QPS | Redis p99 | Solr p99 | Redis max | Solr max |
+| ----------- | --------- | -------- | --------- | -------- | --------- | -------- |
+| 8 | 10,227 | 4,273 | 1.23 ms | 2.58 ms | 3.2 ms | 39.9 ms |
+| 16 | 11,401 | 7,776 | 2.69 ms | 3.59 ms | 7.9 ms | 58.9 ms |
+| 32 | 11,553 | 8,494 | 5.88 ms | 10.69 ms | 108 ms | 267 ms |
+| 48 | 11,848 | **5,377** | 8.17 ms | **53.05 ms** | 219 ms | 295 ms |
+
+Two things stand out, and they're the interesting part rather than the raw
+ratio:
+
+**Redis's throughput is flat and Solr's is not monotonic.** Redis saturates
+around 11–12k QPS and stays there as concurrency climbs. Solr peaks near 8.5k at
+32 threads and then *falls* to 5,377 at 48 — past its knee, adding clients makes
+it slower. For capacity planning that shape matters more than the peak: one
+degrades gracefully, the other has a cliff you can walk off.
+
+**The tail diverges faster than the median.** At 48 threads the p50 gap is
+1.6× but the p99 gap is 6.5×. Solr's worst-case latency is poor even at low
+load — 39.9 ms max at 8 concurrent clients, where Redis is at 3.2 ms — which is
+consistent with JVM GC pauses.
+
+Methodology, since throughput benchmarks are easy to get wrong:
+
+- **worker_threads, not one event loop.** A single-threaded Node client saturates
+  before Redis does, and you end up benchmarking JSON parsing. Each worker gets
+  its own Redis connection and HTTP agent.
+- **Engines are loaded sequentially, never simultaneously.** Both at once on the
+  same 14 cores would have them competing and both numbers would be wrong.
+- **A rotating pool of 27 distinct query terms and 4 filter sets,** so neither
+  engine rides one hot cache entry.
+- **Client CPU is reported and checked.** At 48 threads the load generator used
+  2.67 of 14 cores driving Redis and 5.67 driving Solr, so these are engine
+  limits rather than client limits. The tool prints a `CLIENT-BOUND` warning if
+  that stops being true — believe the warning, not the QPS.
+
+This is also the axis on which Redis Software's [query performance
+factor](https://redis.io/docs/latest/operate/oss_and_stack/stack-with-enterprise/search/query-performance-factor/)
+applies: it provisions additional vCPUs per shard for the query engine and scales
+throughput up to 16×. It is **not** available in the OSS `redis:8` container this
+demo uses, and it wouldn't change the single-query latency numbers elsewhere in
+this README — it's a throughput lever. If the customer's question is "can this
+keep up at our peak," that feature is the answer and this tab is the right place
+to raise it.
+
 ## At 1,000,000 counterparties the result largely inverts
 
 Read this before presenting. The 100k numbers above do **not** scale.

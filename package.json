@@ -10,7 +10,8 @@
     "seed:solr": "node src/seed-solr.js",
     "seed": "npm run generate && npm run seed:redis && npm run seed:solr",
     "seed:1m": "COUNT=1000000 npm run seed",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "bench": "node src/bench.js"
   },
   "dependencies": {
     "express": "^4.21.2",

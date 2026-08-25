@@ -153,6 +153,7 @@
     <button data-s="geo">Geo proximity</button>
     <button data-s="facet">Portfolio breakdown</button>
     <button data-s="lei">Exact LEI lookup</button>
+    <button data-s="throughput">Concurrent throughput</button>
   </div>
   <p class="hint" id="hint"></p>
 
@@ -368,6 +369,11 @@
       seed: '',
       lei: true,
     },
+    throughput: {
+      hint: 'QPS and tail latency under concurrent load. Measured by `npm run bench`, not from this page — driving load from the web server would skew its own numbers.',
+      seed: '',
+      throughput: true,
+    },
   };
 
   let scenario = 'fuzzy';
@@ -390,10 +396,106 @@
     el('geoControls').classList.toggle('show', Boolean(cfg.geo));
     el('facetControls').classList.toggle('show', Boolean(cfg.facet));
     el('leiControls').classList.toggle('show', Boolean(cfg.lei));
-    // The facet scenario has no free-text query, and ordering doesn't apply.
-    el('q').style.display = cfg.facet ? 'none' : '';
-    el('order').closest('label').style.display = (cfg.facet || cfg.lei) ? 'none' : '';
+    // Free-text query, ordering and run count only apply to the live scenarios.
+    el('q').style.display = (cfg.facet || cfg.throughput) ? 'none' : '';
+    el('order').closest('label').style.display =
+      (cfg.facet || cfg.lei || cfg.throughput) ? 'none' : '';
+    el('runs').closest('label').style.display = cfg.throughput ? 'none' : '';
     search();
+  }
+
+  async function showThroughput() {
+    setHeaders([['Metric', ''], ['Value', 'num']]);
+    let d;
+    try {
+      const res = await fetch('/api/bench-results');
+      d = await res.json();
+      if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
+    } catch (err) {
+      for (const id of ['rt', 'st', 'vx']) el(id).textContent = '—';
+      for (const id of ['rsub', 'ssub', 'rcount', 'scount', 'rq', 'sq']) el(id).textContent = '';
+      const msg = 'No benchmark results yet. Run <b>npm run bench</b> in the project directory, ' +
+        'then reload. Options: <b>--scenario=</b>prefix|filtered|fuzzy|lei, ' +
+        '<b>--concurrency=</b>N, <b>--duration=</b>seconds.';
+      for (const id of ['rrows', 'srows']) {
+        el(id).innerHTML = `<tr><td colspan="4" class="empty">not run yet</td></tr>`;
+      }
+      el('bars').replaceChildren();
+      el('method').innerHTML = msg;
+      return;
+    }
+
+    const r = d.engines.redis;
+    const s = d.engines.solr;
+    el('rt').textContent = `${r.qps.toLocaleString()} q/s`;
+    el('st').textContent = `${s.qps.toLocaleString()} q/s`;
+    el('rsub').textContent = `p50 ${r.p50.toFixed(2)}ms · p99 ${r.p99.toFixed(2)}ms`;
+    el('ssub').textContent = `p50 ${s.p50.toFixed(2)}ms · p99 ${s.p99.toFixed(2)}ms`;
+    el('verdict').classList.remove('warn');
+    el('vx').textContent = `${(r.qps / s.qps).toFixed(2)}×`;
+    el('rcount').textContent = `${r.count.toLocaleString()} queries`;
+    el('scount').textContent = `${s.count.toLocaleString()} queries`;
+    el('rq').textContent =
+      `scenario=${d.scenario} concurrency=${d.concurrency} duration=${d.durationSec}s corpus=${d.corpus.toLocaleString()}`;
+    el('sq').textContent = el('rq').textContent;
+
+    const rows = (e) => [
+      ['throughput', `${e.qps.toLocaleString()} q/s`],
+      ['p50', `${e.p50.toFixed(2)} ms`],
+      ['p95', `${e.p95.toFixed(2)} ms`],
+      ['p99', `${e.p99.toFixed(2)} ms`],
+      ['max', `${e.max.toFixed(1)} ms`],
+      ['errors', String(e.errors)],
+      ['client CPU', `${e.clientCpuRatio.toFixed(2)} of ${d.cores} cores`],
+    ];
+    for (const [id, e] of [['rrows', r], ['srows', s]]) {
+      el(id).replaceChildren(...rows(e).map(([k, val]) => {
+        const tr = document.createElement('tr');
+        const a = document.createElement('td');
+        a.className = 'tag';
+        a.textContent = k;
+        const b = document.createElement('td');
+        b.className = 'num nm';
+        b.textContent = val;
+        tr.append(a, b);
+        return tr;
+      }));
+    }
+
+    // Bars compare p99, since tail latency is what capacity planning turns on.
+    const max = Math.max(r.p99, s.p99, 0.001);
+    el('bars').replaceChildren(...[['Redis p99', r.p99, 'redis'], ['Solr p99', s.p99, 'solr']]
+      .map(([name, ms, cls]) => {
+        const row = document.createElement('div');
+        row.className = 'bar-row';
+        const n = document.createElement('div');
+        n.className = 'name';
+        n.textContent = name;
+        const track = document.createElement('div');
+        track.className = 'bar-track';
+        const fill = document.createElement('div');
+        fill.className = `bar-fill ${cls}`;
+        fill.style.width = `${Math.max((ms / max) * 100, 0.6)}%`;
+        track.append(fill);
+        const v = document.createElement('div');
+        v.className = 'val';
+        v.textContent = `${ms.toFixed(2)} ms`;
+        row.append(n, track, v);
+        return row;
+      }));
+
+    const clientBound = Math.max(r.clientCpuRatio, s.clientCpuRatio) > d.cores * 0.8;
+    el('method').innerHTML =
+      `<b>Measured by npm run bench</b>, ${d.concurrency} worker threads per engine, ` +
+      `${d.durationSec}s after a 2s warm-up, over a rotating pool of distinct queries so neither ` +
+      'engine benefits from one hot cache entry. The engines are loaded <b>sequentially, never at ' +
+      'the same time</b> — running both at once would have them competing for the same cores. ' +
+      `Client CPU peaked at ${Math.max(r.clientCpuRatio, s.clientCpuRatio).toFixed(2)} of ` +
+      `${d.cores} cores, so ` +
+      (clientBound
+        ? '<b>the load generator was saturated and these are client limits, not engine limits.</b>'
+        : 'the load generator was not the bottleneck and these are engine limits.') +
+      ` Run at ${new Date(d.generatedAt).toLocaleString()}.`;
   }
 
   // Renders the aggregation buckets in place of the results table.
@@ -508,6 +610,11 @@
     const cfg = SCENARIOS[scenario];
     const seq = ++inflight;
     let url;
+
+    if (cfg.throughput) {
+      await showThroughput();
+      return;
+    }
 
     if (cfg.facet) {
       url = `/api/facet?field=${el('facetField').value}&runs=${el('runs').value}`;
