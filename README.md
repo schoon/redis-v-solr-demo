@@ -91,12 +91,27 @@ Methodology.
 
 | Scenario | Redis | Solr (wall) | Solr (QTime) | Ratio |
 | -------- | ----- | ----------- | ------------ | ----- |
-| Typo-tolerant | ~1.2 ms | ~3.5 ms | ~0 ms | ~2.9× |
-| Prefix | ~1.6 ms | ~3.1 ms | ~0 ms | ~2× |
-| Filtered (8 filters) | ~0.8 ms | ~2.9 ms | ~0 ms | ~3.7× |
-| Geo, 50km radius | ~2.1 ms | ~3.1 ms | ~0 ms | ~1.4× |
-| Exact LEI (`HGETALL`) | ~0.3 ms | ~2.1 ms | ~0 ms | ~7.7× |
-| **Portfolio breakdown** | **~7.5 ms** | **~5.3 ms** | ~2 ms | **0.7× — Solr wins** |
+| Typo-tolerant | 0.97 ms | 3.29 ms | ~0 ms | **3.4×** |
+| Prefix | 0.71 ms | 2.91 ms | ~0 ms | **4.1×** |
+| Filtered screening | 1.03 ms | 2.81 ms | ~0 ms | **2.7×** |
+| Geo, 50km radius | 1.55 ms | 2.83 ms | ~0 ms | **1.8×** |
+| Exact LEI (`HGETALL`) | 0.34 ms | 2.33 ms | ~0 ms | **6.8×** |
+| Portfolio breakdown | 6.43 ms | 4.87 ms | ~2 ms | 0.8× — Solr wins |
+
+**The 100k result survives the methodology critique that breaks the 1M one.**
+Twelve *distinct* queries, one run each, so Solr's filterCache gets no reuse:
+prefix Redis 1.39 ms vs Solr 4.01 ms (2.9×), filtered Redis 1.36 ms vs Solr
+3.87 ms (2.8×). At 1M most of Solr's advantage came from cache reuse across
+repeated queries; at 100k Redis leads either way. That makes 100k the honest
+place to run this demo.
+
+The name sort is also cheap at this size — Redis moves by well under a
+millisecond between `order=relevance` and `order=name`, versus roughly 2× at 1M.
+
+One caveat on memory: Solr's heap is pinned at 2 GB (`-Xms2g`) because the 1M run
+needed it, so the container reports ~2.3 GB regardless of corpus size. Don't
+quote memory at 100k from this configuration — Solr would run comfortably in far
+less. Redis sits at ~245 MB.
 
 ## At 1,000,000 counterparties the result largely inverts
 
