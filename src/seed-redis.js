@@ -14,6 +14,7 @@ const readline = require('readline');
 const { createClient, SchemaFieldTypes } = require('redis');
 const { REDIS_URL, REDIS_PREFIX, REDIS_INDEX, DATA_FILE } = require('./config');
 const { ftInfo } = require('./ft-info');
+const { DIM, vectorsAvailable, loadVectors, vectorBuffer, readMeta } = require('./vectors');
 
 const BATCH = 2000;
 
@@ -26,6 +27,19 @@ async function main() {
   // FLUSHALL — this container is dedicated to the demo, so a clean slate each
   // run keeps the comparison honest (no leftovers inflating or deflating counts).
   await client.flushAll();
+
+  // Embeddings are optional: `npm run seed` skips them so the common path stays
+  // fast, and `npm run seed:vectors` generates them first. The schema and the
+  // per-record write below both branch on this.
+  const hasVectors = vectorsAvailable();
+  let allVectors = null;
+  if (hasVectors) {
+    const meta = readMeta();
+    allVectors = loadVectors();
+    console.log(`Vectors found: ${meta.count.toLocaleString()} × ${meta.dim}d (${meta.model})`);
+  } else {
+    console.log('No vectors found — run `npm run seed:vectors` to enable the semantic tab');
+  }
 
   // FT.CREATE cp:idx ON HASH PREFIX 1 cp: SCHEMA ...
   // The index attaches to every key matching the prefix. Nothing copies the
@@ -63,6 +77,20 @@ async function main() {
       // GEO indexes a "lon,lat" string and enables radius queries.
       // Note the ordering — lon first. Solr's equivalent field wants lat first.
       location: { type: SchemaFieldTypes.GEO },
+
+      // Only present when embeddings have been generated. The narrative note
+      // is indexed as TEXT too, so the hybrid scenario can combine semantic
+      // similarity with an ordinary keyword match on the same field.
+      ...(hasVectors ? {
+        profile: { type: SchemaFieldTypes.TEXT },
+        vector: {
+          type: SchemaFieldTypes.VECTOR,
+          ALGORITHM: 'HNSW',
+          TYPE: 'FLOAT32',
+          DIM,
+          DISTANCE_METRIC: 'COSINE',
+        },
+      } : {}),
     },
     { ON: 'HASH', PREFIX: REDIS_PREFIX }
   );
@@ -85,8 +113,10 @@ async function main() {
     crlfDelay: Infinity,
   });
 
+  let recordIndex = -1;
   for await (const line of stream) {
     if (!line) continue;
+    recordIndex += 1;
     const rec = JSON.parse(line);
 
     // Hash values are strings, so numerics are stored as their decimal
@@ -111,6 +141,12 @@ async function main() {
         onboarded_at: String(rec.onboarded_at),
         // "lon,lat" — the order Redis GEO expects.
         location: `${rec.lon},${rec.lat}`,
+        ...(hasVectors ? {
+          profile: rec.profile,
+          // Raw float32 bytes. A Hash field is binary-safe, so the vector goes
+          // in as a Buffer rather than a stringified array.
+          vector: vectorBuffer(allVectors, recordIndex),
+        } : {}),
       })
     );
 

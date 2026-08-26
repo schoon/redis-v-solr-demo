@@ -348,11 +348,12 @@
     <button data-s="facet">Breakdown</button>
     <button data-s="lei">LEI lookup</button>
     <button data-s="throughput">Throughput</button>
+    <button data-s="semantic">Semantic</button>
     <button data-s="index">Index</button>
   </div>
   <p class="hint" id="hint"></p>
   <p class="shortcuts">
-    <kbd>1</kbd>–<kbd>8</kbd> scenarios · <kbd>Enter</kbd> re-run ·
+    <kbd>1</kbd>–<kbd>9</kbd> scenarios · <kbd>Enter</kbd> re-run ·
     <kbd>P</kbd> presentation mode · <kbd>Esc</kbd> overview
   </p>
 
@@ -486,6 +487,18 @@
     </label>
   </div>
 
+  <div class="filters" id="semanticControls">
+    <label class="inline">mode
+      <select id="semanticMode">
+        <option value="vector" selected>vector only</option>
+        <option value="hybrid">hybrid</option>
+      </select>
+    </label>
+    <label class="inline">must mention
+      <input type="text" id="keyword" placeholder="e.g. collateral" style="width:9rem" autocomplete="off">
+    </label>
+  </div>
+
   <div class="filters" id="leiControls">
     <button id="sampleLei" type="button">Pick a random LEI from the corpus</button>
   </div>
@@ -599,6 +612,31 @@
       seeds: [''],
       throughput: true,
     },
+    semantic: {
+      hint: 'Ask in English. The question is embedded once and the same vector goes to both engines — Redis KNN vs Solr {!knn}. Switch to hybrid to add filters and a keyword.',
+      placeholder: 'ask a question about the portfolio',
+      seeds: [
+        // Every question here is verified to return a topically correct top hit.
+        // Questions about *status* ("which relationships are being wound down")
+        // score poorly and are deliberately absent: the status sentence is one
+        // short clause among several, so it gets diluted in the embedding, and
+        // "relationship being wound down" matched "relationship has expanded".
+        // Structured attributes belong in a filter, which is what hybrid mode
+        // demonstrates — that's a property of bi-encoder embeddings, not a bug.
+        'which counterparties have liquidity problems?',
+        'who is under sanctions review?',
+        'firms with commercial real estate concentration',
+        'anyone with a qualified audit opinion?',
+        'who had a cyber incident?',
+        'which firms breached a covenant?',
+        'entities with ESG or emissions concerns',
+        'exposure to crypto-asset intermediaries',
+        'which firms missed collateral calls?',
+        'management turnover slowing remediation',
+        'who is well capitalised and stable?',
+      ],
+      semantic: true,
+    },
     index: {
       hint: 'What actually got built on each side: the Redis index definition and its cost, next to the Solr schema.',
       seeds: [''],
@@ -696,11 +734,16 @@
     el('geoControls').classList.toggle('show', Boolean(cfg.geo));
     el('facetControls').classList.toggle('show', Boolean(cfg.facet));
     el('leiControls').classList.toggle('show', Boolean(cfg.lei));
+    el('semanticControls').classList.toggle('show', Boolean(cfg.semantic));
+    // Hybrid mode reuses the screening filters, so show them too.
+    if (cfg.semantic && el('semanticMode').value === 'hybrid') {
+      el('filters').classList.add('show');
+    }
     // Free-text query, ordering and run count only apply to the live scenarios.
     const noQuery = cfg.facet || cfg.throughput || cfg.index;
     el('q').style.display = noQuery ? 'none' : '';
     el('order').closest('label').style.display =
-      (cfg.facet || cfg.lei || cfg.throughput || cfg.index) ? 'none' : '';
+      (cfg.facet || cfg.lei || cfg.throughput || cfg.index || cfg.semantic) ? 'none' : '';
     el('runs').closest('label').style.display =
       (cfg.throughput || cfg.index) ? 'none' : '';
     // The verdict label is repurposed by the index tab, so reset it here.
@@ -718,6 +761,99 @@
     }
 
     search();
+  }
+
+  async function showSemantic() {
+    const mode = el('semanticMode').value;
+    const params = new URLSearchParams({
+      q: el('q').value,
+      mode,
+      runs: el('runs').value,
+      limit: '10',
+    });
+    if (mode === 'hybrid') {
+      params.set('countries', selectedCountries().join(','));
+      params.set('minRating', el('minRating').value);
+      params.set('status', el('status').value);
+      params.set('maxRisk', el('maxRisk').value);
+      params.set('keyword', el('keyword').value);
+    }
+
+    const seq = ++inflight;
+    document.body.classList.add('loading');
+    let d;
+    try {
+      const res = await fetch(`/api/semantic?${params}`);
+      d = await res.json();
+      if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
+    } catch (err) {
+      document.body.classList.remove('loading');
+      el('method').innerHTML = `<b>Error:</b> ${err.message}`;
+      for (const id of ['rrows', 'srows']) {
+        el(id).innerHTML = '<tr><td colspan="3" class="empty">no embeddings — run npm run seed:vectors</td></tr>';
+      }
+      return;
+    } finally {
+      if (seq === inflight) document.body.classList.remove('loading');
+    }
+    if (seq !== inflight) return;
+
+    setHeaders([['Counterparty', ''], ['Credit review note', ''], ['Sim', 'num']]);
+
+    el('rt').textContent = `${d.redis.ms.toFixed(2)} ms`;
+    el('st').textContent = `${d.solr.ms.toFixed(2)} ms`;
+    el('rsub').textContent = `median of ${d.runs} · KNN top ${d.limit}`;
+    el('ssub').textContent = `median of ${d.runs} · QTime ${d.solr.qtime} ms · KNN top ${d.limit}`;
+    el('verdict').classList.remove('warn');
+    el('vx').textContent = `${(d.solr.ms / d.redis.ms).toFixed(1)}×`;
+    el('rcount').textContent = `${d.redis.hits.length} hits`;
+    el('scount').textContent = `${d.solr.hits.length} hits`;
+    el('rq').textContent = d.redis.query;
+    el('sq').textContent = d.solr.query;
+
+    const rows = (hits) => hits.map((h) => {
+      const tr = document.createElement('tr');
+      const a = document.createElement('td');
+      const nm = document.createElement('div');
+      nm.className = 'nm';
+      nm.textContent = h.legal_name || '';
+      const meta = document.createElement('div');
+      meta.className = 'tag';
+      meta.textContent = `${h.country} · ${h.credit_rating} · risk ${h.risk_score} · ${h.status}`;
+      a.append(nm, meta);
+      const b = document.createElement('td');
+      b.className = 'tag';
+      // The clause the question actually matched is the interesting part.
+      const note = (h.profile || '');
+      const idx = note.indexOf('Credit review notes that ');
+      b.textContent = idx >= 0 ? note.slice(idx + 25, idx + 165) : note.slice(0, 140);
+      const c = document.createElement('td');
+      c.className = 'num nm';
+      c.textContent = h.similarity.toFixed(3);
+      tr.append(a, b, c);
+      return tr;
+    });
+    el('rrows').replaceChildren(...rows(d.redis.hits));
+    el('srows').replaceChildren(...rows(d.solr.hits));
+
+    renderBars(d.redis.ms, d.solr.ms, d.solr.qtime);
+
+    el('method').innerHTML =
+      `<b>The question is embedded once</b> — ${d.embedMs} ms with ${d.model}, running locally — `
+      + 'and the same vector goes to both engines, so neither is charged for the embedding and '
+      + 'neither gets a different query. Redis returns a cosine <i>distance</i> and Solr a cosine '
+      + '<i>similarity</i>; both are shown as similarity here so the two panes read on one scale. '
+      + (mode === 'hybrid'
+        ? '<b>Hybrid mode</b> puts the screening filters and the keyword requirement in front of the '
+          + 'vector search. Redis expresses that as one query — the filter runs first and KNN only '
+          + 'sees survivors. Solr takes the filters as separate <code>fq</code> parameters. '
+        : '<b>Vector-only mode</b> searches the whole corpus by meaning. Switch to hybrid to combine '
+          + 'it with jurisdiction, rating, status and a keyword the note must contain. ')
+      + `<b>The engines agreed on ${d.overlap} of ${d.limit} results.</b> Both run HNSW, which is `
+      + 'approximate, so identical result sets are not guaranteed even on identical vectors — that '
+      + 'is a property of approximate nearest neighbour, not a sign either engine is wrong. Redis '
+      + 'runs with <code>EF_RUNTIME 100</code> to match Solr\'s default beam width; at the Redis '
+      + 'default of 10 the two agreed on as few as 0 of 10.';
   }
 
   async function showIndexInfo() {
@@ -1022,6 +1158,11 @@
       return;
     }
 
+    if (cfg.semantic) {
+      await showSemantic();
+      return;
+    }
+
     if (cfg.facet) {
       url = `/api/facet?field=${el('facetField').value}&runs=${el('runs').value}`;
     } else if (cfg.lei) {
@@ -1213,6 +1354,14 @@
   });
   el('runs').addEventListener('change', search);
   el('order').addEventListener('change', search);
+  el('semanticMode').addEventListener('change', () => {
+    el('filters').classList.toggle('show', el('semanticMode').value === 'hybrid');
+    search();
+  });
+  el('keyword').addEventListener('input', () => {
+    clearTimeout(debounce);
+    debounce = setTimeout(search, 200);
+  });
   for (const id of ['minRating', 'status', 'maxRisk', 'minExposure',
     'onboardedMonths', 'centre', 'radiusKm', 'facetField']) {
     el(id).addEventListener('change', search);
@@ -1250,7 +1399,7 @@
 
   // ---- keyboard driving --------------------------------------------------
 
-  const SCENARIO_KEYS = ["fuzzy", "prefix", "filtered", "geo", "facet", "lei", "throughput", "index"];
+  const SCENARIO_KEYS = ["fuzzy", "prefix", "filtered", "geo", "facet", "lei", "throughput", "semantic", "index"];
 
   document.addEventListener('keydown', (e) => {
     // Esc always works, including from the query box, so there's a reliable way

@@ -64,7 +64,7 @@ The containers hold no volumes, so `docker compose down` discards the data.
 Re-run `npm run demo` — it's idempotent, and both seeders wipe their engine
 before loading.
 
-## The eight scenarios
+## The nine scenarios
 
 | Scenario | The real-world question | Redis | Solr |
 | -------- | ----------------------- | ----- | ---- |
@@ -75,6 +75,7 @@ before loading.
 | **Portfolio breakdown** | "Total exposure by credit rating" | `FT.AGGREGATE` | JSON Facet API |
 | **Exact LEI lookup** | Known-item retrieval by identifier | `HGETALL` — no index at all | `q=id:"…"` |
 | **Concurrent throughput** | "Will it keep up at our peak?" | `npm run bench` | `npm run bench` |
+| **Semantic & hybrid** | "Which counterparties have liquidity problems?" | `KNN` on a `VECTOR` field | `{!knn}` on `DenseVectorField` |
 | **Index & schema** | "What did you actually build?" | one `FT.CREATE` | core + Schema API per field |
 
 The exact query sent to each engine is displayed under its results pane, so
@@ -94,7 +95,7 @@ Two UI controls worth knowing about:
   ordering each pane shows a different arbitrary ten out of an identical result
   set. [Details](docs/METHODOLOGY.md#result-ordering).
 - **presentation mode** (or `P`) scales the whole UI for a projector.
-  `1`–`8` switch scenarios, `Enter` re-runs, `Esc` returns to the overview.
+  `1`–`9` switch scenarios, `Enter` re-runs, `Esc` returns to the overview.
 
 ## Observed on one laptop
 
@@ -157,6 +158,45 @@ It's a CLI tool rather than a UI button because driving load from the web server
 would have the load generator competing with what it's measuring. Full
 methodology, and where Redis Software's query performance factor fits, in
 [Methodology](docs/METHODOLOGY.md#concurrent-throughput).
+
+## Semantic search — and yes, Solr does vectors
+
+Each counterparty carries a narrative credit-review note. Those notes are
+embedded locally with **all-MiniLM-L6-v2** (384 dimensions, via
+transformers.js — no API key, no network at query time) and indexed as vectors
+in both engines, so you can ask questions in English:
+
+> *"which counterparties have liquidity problems?"*
+> *"who is under sanctions review?"*
+> *"firms with commercial real estate concentration"*
+
+**Solr can do this too**, which is worth knowing before a customer asks:
+`solr.DenseVectorField` with an HNSW index and the `{!knn}` query parser. That
+was verified against this image before the tab was built, not assumed — so this
+tab is a like-for-like comparison, not a capability gap.
+
+The tab has two modes:
+
+- **vector only** — pure semantic search across the whole corpus.
+- **hybrid** — the same vector search, narrowed by jurisdiction, rating, status
+  and a keyword the note must contain. Redis expresses that as a single query
+  where the filter runs *before* the KNN; Solr takes the filters as separate
+  `fq` parameters.
+
+Enabling it is a separate step because embedding 100,000 notes takes about
+**11 minutes** on a laptop:
+
+```bash
+npm run seed:vectors      # generate + embed + load both engines
+```
+
+Without it the tab explains what to run; every other scenario works as normal.
+
+Notes on interpreting the tab, in
+[Methodology](docs/METHODOLOGY.md#semantic-and-hybrid-search): the engines agree
+on roughly half the top ten, because HNSW is approximate on both sides; the
+embedding time is reported separately since it's identical for both; and the
+Redis index grows from 70.6 MB to ~305 MB once vectors are in it.
 
 ## Data model
 

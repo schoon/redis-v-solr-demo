@@ -11,6 +11,7 @@
 //              (Redis TAG + NUMERIC       / Solr fq params)
 
 const { REDIS_INDEX } = require('./config');
+const { solrFloats } = require('./vectors');
 
 // User input goes into two different query languages, both of which have
 // special characters. Rather than escape for each dialect, reduce input to
@@ -258,6 +259,94 @@ function solrFacetParams(field, limit = 25) {
   return params;
 }
 
+// ------------------------------------------------ vector / semantic search
+
+// Redis: FT.SEARCH with a KNN clause.
+//
+//   *=>[KNN 10 @vector $BLOB AS vscore]
+//
+// The part before => is an ordinary filter; the part after is the vector
+// search. With `*` it's pure semantic search over everything. Substituting a
+// real filter expression makes it hybrid, and Redis applies that filter
+// BEFORE the KNN — the vector search runs only over the surviving documents.
+// DIALECT 2 is required for this syntax.
+//
+// COSINE returns a *distance* (0 = identical), so similarity is 1 - distance.
+function redisVectorArgs(vectorBuf, limit, filterExpr = '*') {
+  // EF_RUNTIME controls how much of the HNSW graph is explored. Redis defaults
+  // to 10, which with topK=10 is the least work possible and measurably hurts
+  // recall — the two engines agreed on as few as 0 of 10 results before this.
+  // Solr's default beam width is 100, so 100 here is the matching setting
+  // rather than a thumb on the scale.
+  //
+  // Runtime attributes go in a trailing `=>{...}` block. Putting EF_RUNTIME
+  // inside the KNN clause is a syntax error:
+  //   SEARCH_SYNTAX Syntax error at offset 35 near EF_RUNTIME
+  const query = `${filterExpr}=>[KNN ${limit} @vector $BLOB AS vscore]=>{$EF_RUNTIME: 100}`;
+  return [
+    'FT.SEARCH', REDIS_INDEX, query,
+    'PARAMS', '2', 'BLOB', vectorBuf,
+    'SORTBY', 'vscore',
+    'LIMIT', '0', String(limit),
+    'RETURN', '8', 'id', 'legal_name', 'country', 'credit_rating',
+    'risk_score', 'status', 'profile', 'vscore',
+    'DIALECT', '2',
+  ];
+}
+
+// Solr: the {!knn} query parser over a DenseVectorField. Score is cosine
+// similarity (higher is better), the opposite convention to Redis's distance.
+//
+// Filters go in fq. Whether Solr treats those as a pre-filter or a post-filter
+// matters for hybrid search and is measured rather than assumed — see the
+// methodology notes.
+function solrVectorParams(vector, limit, filters = []) {
+  const params = new URLSearchParams();
+  // Same 9-significant-digit encoding as the seeder: a query vector can carry
+  // the same long decimals that Solr rejects on ingest.
+  params.set('q', `{!knn f=vector topK=${limit}}[${solrFloats(vector).join(',')}]`);
+  params.set('rows', String(limit));
+  params.set('wt', 'json');
+  params.set('fl', 'id,legal_name,country,credit_rating,risk_score,status,profile,score');
+  for (const f of filters) params.append('fq', f);
+  return params;
+}
+
+// Builds the filter expression for each engine from the same inputs, so the
+// hybrid comparison is like-for-like.
+function hybridFilters(filters) {
+  const redisClauses = [];
+  const solrFq = [];
+
+  if (filters.countries?.length) {
+    redisClauses.push(`@country:{${filters.countries.join('|')}}`);
+    solrFq.push(`country:(${filters.countries.join(' OR ')})`);
+  }
+  if (filters.status) {
+    redisClauses.push(`@status:{${filters.status}}`);
+    solrFq.push(`status:${filters.status}`);
+  }
+  if (Number.isFinite(filters.minRating)) {
+    redisClauses.push(`@rating_score:[${filters.minRating} +inf]`);
+    solrFq.push(`rating_score:[${filters.minRating} TO *]`);
+  }
+  if (Number.isFinite(filters.maxRisk)) {
+    redisClauses.push(`@risk_score:[-inf ${filters.maxRisk}]`);
+    solrFq.push(`risk_score:[* TO ${filters.maxRisk}]`);
+  }
+  // A keyword requirement on the narrative text, which is what makes this
+  // genuinely hybrid rather than just filtered-vector.
+  if (filters.keyword) {
+    redisClauses.push(`@profile:(${filters.keyword})`);
+    solrFq.push(`profile:(${filters.keyword})`);
+  }
+
+  return {
+    redis: redisClauses.length ? `(${redisClauses.join(' ')})` : '*',
+    solr: solrFq,
+  };
+}
+
 // ------------------------------------------------ exact LEI lookup
 
 // Structurally different rather than merely faster: the record lives at a known
@@ -283,6 +372,9 @@ module.exports = {
   solrParams,
   redisAggregateArgs,
   solrFacetParams,
+  redisVectorArgs,
+  solrVectorParams,
+  hybridFilters,
   redisLeiKey,
   solrLeiParams,
   REDIS_RETURN,

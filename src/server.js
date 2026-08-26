@@ -8,10 +8,12 @@ const { REDIS_URL, SOLR_URL, PORT, REDIS_INDEX } = require('./config');
 const {
   sanitize, redisQuery, redisSearchArgs, solrParams,
   redisAggregateArgs, solrFacetParams, redisLeiKey, solrLeiParams,
+  redisVectorArgs, solrVectorParams, hybridFilters,
 } = require('./queries');
 // Not client.ft.info() — its positional parser is shifted against Redis 8's
 // reply. See src/ft-info.js.
 const { ftInfo, toCreateCommand } = require('./ft-info');
+const { MODEL, vectorsAvailable, embedQuery, warmEmbedder } = require('./vectors');
 
 // Financial centres offered by the geo scenario. Coordinates are [lat, lon];
 // each engine's query builder reorders as needed.
@@ -388,6 +390,155 @@ app.get('/api/sample-lei', async (req, res) => {
   }
 });
 
+// GET /api/semantic?q=<english question>&mode=vector|hybrid&runs=N
+//   plus the usual filters when mode=hybrid, and &keyword= for a term the
+//   narrative text must also contain.
+//
+// The question is embedded once, then the same vector goes to both engines, so
+// neither is charged for the embedding and neither gets a different query.
+app.get('/api/semantic', async (req, res) => {
+  if (!vectorsAvailable()) {
+    return res.status(404).json({ error: 'no embeddings — run: npm run seed:vectors' });
+  }
+
+  const question = String(req.query.q || '').slice(0, 400);
+  if (!question.trim()) return res.status(400).json({ error: 'q is required' });
+
+  const mode = req.query.mode === 'hybrid' ? 'hybrid' : 'vector';
+  const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), 50);
+  const runs = Math.min(Math.max(Number(req.query.runs) || 1, 1), 25);
+  const num = (v) => (v === '' || v === undefined ? NaN : Number(v));
+
+  const filters = mode === 'hybrid' ? {
+    countries: String(req.query.countries || '').split(',')
+      .map((c) => c.trim().toUpperCase()).filter((c) => /^[A-Z]{2}$/.test(c)),
+    status: /^[A-Z_]{3,12}$/.test(req.query.status || '') ? req.query.status : '',
+    minRating: num(req.query.minRating),
+    maxRisk: num(req.query.maxRisk),
+    // Same sanitising as the lexical scenarios: letters, digits and spaces.
+    keyword: String(req.query.keyword || '').toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').trim(),
+  } : {};
+
+  try {
+    // Embedded once, outside the timed section. The embedding cost is real but
+    // it's identical for both engines, so including it would just add a
+    // constant to each and muddy the comparison. It's reported separately.
+    const embedStart = nowMs();
+    const vector = await embedQuery(question);
+    const embedMs = nowMs() - embedStart;
+    const buf = Buffer.from(new Float32Array(vector).buffer);
+
+    const built = hybridFilters(filters);
+    const redisFilter = mode === 'hybrid' ? built.redis : '*';
+    const solrFq = mode === 'hybrid' ? built.solr : [];
+
+    const rTimes = [];
+    const sTimes = [];
+    let rRes;
+    let sRes;
+
+    for (let i = 0; i < runs; i += 1) {
+      const doRedis = async () => {
+        const args = redisVectorArgs(buf, limit, redisFilter);
+        const t0 = nowMs();
+        const reply = await redis.sendCommand(args);
+        const ms = nowMs() - t0;
+        // RESP2: [total, key, [f, v, ...], key, [f, v, ...], ...]
+        const docs = [];
+        for (let j = 1; j < reply.length; j += 2) {
+          const fields = {};
+          const arr = reply[j + 1] || [];
+          for (let k = 0; k < arr.length; k += 2) fields[String(arr[k])] = String(arr[k + 1]);
+          docs.push(fields);
+        }
+        return { ms, total: Number(reply[0]), docs };
+      };
+      const doSolr = async () => {
+        const params = solrVectorParams(vector, limit, solrFq);
+        const t0 = nowMs();
+        const r = await fetch(`${SOLR_URL}/select?${params.toString()}`);
+        const body = await r.json();
+        const ms = nowMs() - t0;
+        return {
+          ms,
+          qtime: body.responseHeader?.QTime,
+          total: body.response?.numFound ?? 0,
+          docs: body.response?.docs || [],
+        };
+      };
+
+      if (i % 2 === 0) { rRes = await doRedis(); sRes = await doSolr(); } else { sRes = await doSolr(); rRes = await doRedis(); }
+      rTimes.push(rRes.ms);
+      sTimes.push(sRes.ms);
+    }
+
+    const redisMs = median(rTimes);
+    const solrMs = median(sTimes);
+
+    // Redis COSINE returns a distance (0 = identical); Solr returns cosine
+    // similarity. Both are normalised to similarity here so the two panes are
+    // reading the same scale.
+    const redisHits = rRes.docs.map((d) => ({
+      id: d.id,
+      legal_name: d.legal_name,
+      country: d.country,
+      credit_rating: d.credit_rating,
+      risk_score: Number(d.risk_score),
+      status: d.status,
+      profile: d.profile,
+      similarity: Number((1 - Number(d.vscore)).toFixed(4)),
+    }));
+    const solrHits = sRes.docs.map((d) => ({
+      id: d.id,
+      legal_name: d.legal_name,
+      country: d.country,
+      credit_rating: d.credit_rating,
+      risk_score: Number(d.risk_score),
+      status: d.status,
+      profile: d.profile,
+      // Lucene does NOT return raw cosine similarity: for the cosine function
+      // it scores (1 + cos) / 2, to keep scores non-negative. Displaying that
+      // next to Redis's raw similarity made the panes look like they disagreed
+      // about relevance — 0.786 against 0.580 for equivalent documents. Undoing
+      // the transform puts both on the same scale: 2 × 0.786 − 1 = 0.572, which
+      // is what Redis reports.
+      similarity: Number((2 * Number(d.score) - 1).toFixed(4)),
+    }));
+
+    const overlap = redisHits.filter((h) => solrHits.some((s) => s.id === h.id)).length;
+
+    res.json({
+      question,
+      mode,
+      runs,
+      embedMs: Number(embedMs.toFixed(1)),
+      model: MODEL,
+      redis: {
+        ms: Number(redisMs.toFixed(3)),
+        total: rRes.total,
+        hits: redisHits,
+        query: `${redisFilter}=>[KNN ${limit} @vector $BLOB AS vscore]  DIALECT 2`,
+      },
+      solr: {
+        ms: Number(solrMs.toFixed(3)),
+        qtime: sRes.qtime,
+        total: sRes.total,
+        hits: solrHits,
+        query: `q={!knn f=vector topK=${limit}}[…${vector.length} floats…]`
+          + (solrFq.length ? `  fq=${solrFq.join('  fq=')}` : ''),
+      },
+      // Both engines run HNSW, which is approximate — identical result sets
+      // aren't guaranteed even on identical vectors. Overlap is reported
+      // instead of demanding an exact match.
+      overlap,
+      limit,
+    });
+  } catch (err) {
+    console.error('semantic failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/index-info — what actually got built on each side.
 //
 // Shows the Redis index definition and its cost next to the Solr schema. It's
@@ -525,6 +676,14 @@ async function start() {
   console.log(`Solr core counterparties: ${solrBody.response.numFound.toLocaleString()} docs`);
   if (info.stats.numDocs !== solrBody.response.numFound) {
     console.warn('WARNING: document counts differ — re-run `npm run seed` for a fair comparison');
+  }
+
+  if (vectorsAvailable()) {
+    process.stdout.write('Warming the embedding model...');
+    await warmEmbedder();
+    console.log(` ready (${MODEL})`);
+  } else {
+    console.log('No embeddings — the Semantic tab will ask for `npm run seed:vectors`');
   }
 
   const server = app.listen(PORT, () => {

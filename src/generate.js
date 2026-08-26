@@ -112,6 +112,56 @@ const CITY_COORDS = {
   'George Town': [19.2866, -81.3744],
 };
 
+// Narrative credit-review text, for the semantic-search tab. Themes are keyed
+// to the record's risk score so the corpus is internally coherent: asking
+// "who has liquidity problems" should surface genuinely distressed names, not
+// random ones, otherwise the vector demo proves nothing.
+const DISTRESS = [
+  'liquidity has deteriorated sharply across two consecutive quarters',
+  'the firm missed two collateral calls in the last ninety days',
+  'auditors issued a qualified opinion on the latest annual accounts',
+  'a covenant breach was waived pending refinancing negotiations',
+  'rating agencies placed the entity on negative outlook',
+  'material litigation is outstanding with a former clearing counterparty',
+  'funding costs have risen steeply as wholesale lines were withdrawn',
+];
+
+const WATCH = [
+  'concentration in commercial real estate lending remains elevated',
+  'exposure to crypto-asset intermediaries is under active monitoring',
+  'sanctions screening flagged a beneficial owner for enhanced review',
+  'a cyber incident briefly disrupted settlement operations',
+  'senior management turnover has slowed remediation work',
+  'the ESG assessment highlighted financed-emissions concerns',
+  'intragroup guarantees make the true recourse position hard to assess',
+];
+
+const HEALTHY = [
+  'capital ratios remain comfortably above regulatory minimums',
+  'the funding profile is diversified with stable deposit inflows',
+  'the most recent onboarding refresh produced no adverse findings',
+  'collateral posting has been timely throughout the period',
+  'the relationship has expanded into cleared derivatives',
+  'stress testing showed resilience to a severe rates shock',
+];
+
+const BUSINESS = [
+  'Primary business is structured lending to mid-market borrowers',
+  'The firm intermediates FX and rates flow for regional banks',
+  'It manages segregated mandates for pension and insurance clients',
+  'Activity is concentrated in securities financing and repo',
+  'It underwrites trade finance across emerging markets',
+  'The desk runs systematic equity strategies',
+  'It provides custody and fund administration services',
+];
+
+const STATUS_NOTE = {
+  ACTIVE: 'The relationship is active and in good standing.',
+  PENDING: 'Onboarding is incomplete pending outstanding KYC documentation.',
+  SUSPENDED: 'Trading is suspended pending remediation of control failures.',
+  TERMINATED: 'The relationship is being wound down and limits have been revoked.',
+};
+
 const SECTORS = [
   'Banking', 'Insurance', 'Asset Management', 'Energy', 'Utilities',
   'Technology', 'Healthcare', 'Industrials', 'Real Estate', 'Sovereign',
@@ -135,6 +185,34 @@ const LEI_CHARS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 function main() {
   const random = makeRandom(SEED);
   const pick = (arr) => arr[Math.floor(random() * arr.length)];
+
+  // Deliberately a SEPARATE stream. Drawing the narrative text from `random`
+  // would consume extra values and shift every subsequent field, changing the
+  // whole corpus and invalidating every count quoted in the docs — which is
+  // exactly what happened when lat/lon was added. An independent stream leaves
+  // the original fifteen fields byte-identical.
+  const randomText = makeRandom(SEED + 1);
+  const pickText = (arr) => arr[Math.floor(randomText() * arr.length)];
+
+  // Two themed observations, weighted by how risky the record already is.
+  function profileFor(rec) {
+    const themes = rec.risk_score > 70
+      ? [DISTRESS, randomText() < 0.6 ? DISTRESS : WATCH]
+      : rec.risk_score > 35
+        ? [WATCH, randomText() < 0.5 ? WATCH : HEALTHY]
+        : [HEALTHY, randomText() < 0.7 ? HEALTHY : WATCH];
+    const a = pickText(themes[0]);
+    let b = pickText(themes[1]);
+    if (b === a) b = pickText(themes[1]);
+
+    const type = rec.entity_type.toLowerCase().replace(/_/g, ' ');
+    return `${rec.legal_name} is a ${rec.country}-domiciled ${type} operating in the `
+      + `${rec.sector.toLowerCase()} sector, headquartered in ${rec.city}. `
+      + `${pickText(BUSINESS)}. Credit review notes that ${a}, and that ${b}. `
+      + `${STATUS_NOTE[rec.status]} `
+      + `Internal risk score ${rec.risk_score} against a ${rec.credit_rating} rating, `
+      + `with total exposure of ${(rec.exposure_usd / 1e6).toFixed(0)} million US dollars.`;
+  }
 
   fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
   const out = fs.createWriteStream(DATA_FILE);
@@ -189,6 +267,9 @@ function main() {
       status: pick(STATUSES),
       onboarded_at: nowSeconds - Math.floor(random() * 10 * 365 * 24 * 3600),
     };
+
+    // Added after the record is complete, so it can read the other fields.
+    record.profile = profileFor(record);
 
     if (!out.write(`${JSON.stringify(record)}\n`)) {
       // Backpressure: without this, 100k writes queue in memory.

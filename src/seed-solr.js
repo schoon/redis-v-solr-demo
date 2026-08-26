@@ -17,6 +17,7 @@
 const fs = require('fs');
 const readline = require('readline');
 const { SOLR_URL, DATA_FILE } = require('./config');
+const { DIM, vectorsAvailable, loadVectors, readMeta, solrFloats } = require('./vectors');
 
 const BATCH = 5000;
 
@@ -60,6 +61,18 @@ const FIELDS = [
   { name: 'location', type: 'location', indexed: true, stored: true, multiValued: false },
 ];
 
+// Appended only when embeddings exist, mirroring the Redis side.
+//
+// Note the vector field deliberately omits `multiValued`. Every other field
+// here sets it to false, but DenseVectorField manages its own arity — the value
+// arrives as a JSON array of floats, and declaring multiValued:false makes Solr
+// try to cast that list to a single value and fail the whole batch with
+// "ClassCastException: Error adding field 'vector'='[-0.056…]'".
+const VECTOR_FIELDS = [
+  { name: 'profile', type: 'text_general', indexed: true, stored: true, multiValued: false },
+  { name: 'vector', type: 'knn_vector', indexed: true, stored: true },
+];
+
 async function solrPost(pathname, body) {
   const res = await fetch(`${SOLR_URL}${pathname}`, {
     method: 'POST',
@@ -78,12 +91,32 @@ async function solrGet(pathname) {
   return JSON.parse(text);
 }
 
+// Solr does have vectors: solr.DenseVectorField with an HNSW index, queried
+// through the {!knn} parser. Verified against this image before the comparison
+// was built rather than assumed — the answer to "can Solr do this at all" is yes.
+async function ensureVectorType() {
+  const types = await solrGet('/schema/fieldtypes?wt=json');
+  const have = new Set((types.fieldTypes || []).map((t) => t.name));
+  if (have.has('knn_vector')) return;
+  await solrPost('/schema', {
+    'add-field-type': {
+      name: 'knn_vector',
+      class: 'solr.DenseVectorField',
+      vectorDimension: DIM,
+      similarityFunction: 'cosine',
+      knnAlgorithm: 'hnsw',
+    },
+  });
+  console.log(`Declared Solr field type knn_vector (${DIM}d, cosine, hnsw)`);
+}
+
 async function ensureSchema() {
   const existing = await solrGet('/schema/fields?wt=json');
   const have = new Set(existing.fields.map((f) => f.name));
 
-  const toAdd = FIELDS.filter((f) => !have.has(f.name));
-  const toReplace = FIELDS.filter((f) => have.has(f.name));
+  const all = vectorsAvailable() ? [...FIELDS, ...VECTOR_FIELDS] : FIELDS;
+  const toAdd = all.filter((f) => !have.has(f.name));
+  const toReplace = all.filter((f) => have.has(f.name));
 
   // Schema API: declares the fields up front rather than letting Solr guess
   // types from the first document it sees. Existing fields are replaced rather
@@ -141,6 +174,15 @@ async function main() {
   await solrPost('/update?commit=true', { delete: { query: '*:*' } });
   console.log('Cleared existing documents');
 
+  const hasVectors = vectorsAvailable();
+  let allVectors = null;
+  if (hasVectors) {
+    const meta = readMeta();
+    allVectors = loadVectors();
+    console.log(`Vectors found: ${meta.count.toLocaleString()} × ${meta.dim}d (${meta.model})`);
+    await ensureVectorType();
+  }
+
   await ensureSchema();
 
   const loadStarted = Date.now();
@@ -186,6 +228,14 @@ async function main() {
       onboarded_at: rec.onboarded_at,
       // "lat,lon" — the order Solr expects, the reverse of Redis.
       location: `${rec.lat},${rec.lon}`,
+      ...(hasVectors ? {
+        profile: rec.profile,
+        // Solr takes the vector as JSON numbers, where Redis takes raw bytes.
+        // solrFloats() trims each to 9 significant digits — lossless for
+        // float32, and short enough for Solr's JSON parser to accept. See the
+        // note in src/vectors.js for why that is necessary.
+        vector: solrFloats(allVectors.subarray(count * DIM, (count + 1) * DIM)),
+      } : {}),
     });
 
     count += 1;

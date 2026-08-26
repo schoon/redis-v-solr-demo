@@ -167,6 +167,80 @@ peak," that feature is the answer and this tab is the right place to raise it.
 Note the docs are candid that some use cases don't scale effectively, so it needs
 measuring rather than asserting.
 
+## Semantic and hybrid search
+
+Each counterparty has a narrative credit-review note, embedded with
+all-MiniLM-L6-v2 (384 dimensions) via transformers.js. Both engines index the
+same vectors: Redis as a `VECTOR` field with HNSW/COSINE, Solr as
+`solr.DenseVectorField` with HNSW/cosine.
+
+**Solr's vector support was verified, not assumed.** A 4-dimension probe field
+plus a `{!knn}` query returned correct similarity scores (0.998 for a near
+vector, 0.550 for a far one) before any of this was built. The answer to "can
+Solr do vectors" is yes, so the tab is a like-for-like comparison.
+
+**What is held identical**
+
+- One embedding per question, computed once and sent to both engines. Neither is
+  charged for the embedding, and neither receives a different vector. The
+  embedding time (~2 ms) is reported separately.
+- The same model, dimension and similarity function on both sides.
+- `EF_RUNTIME 100` on the Redis side to match Solr's default HNSW beam width of
+  100. Redis defaults to 10, which with `topK=10` is the least search effort
+  possible: at that setting the two engines agreed on as few as **0 of 10**
+  results. That was a misconfiguration on our side, not a Solr advantage.
+- Redis returns a cosine *distance* and Solr a *transformed* similarity. Lucene
+  does not return raw cosine for the cosine function — it scores `(1 + cos) / 2`
+  to keep scores non-negative. Shown untransformed, the panes looked like they
+  disagreed about relevance (0.786 against 0.580 for equivalent documents).
+  Undoing it puts both on the raw-cosine scale, verified to agree to four
+  decimal places on every document appearing in both top-tens.
+
+**Both engines run approximate search, so the result sets differ.** HNSW is
+approximate by construction, on both sides. The tab reports how many of the top
+ten the two engines agreed on rather than demanding an exact match — an exact
+match isn't a meaningful bar for ANN, and claiming one would be wrong.
+
+**What the vector represents.** The embedded text is the narrative *without* the
+opening identity sentence. Embedding the full note, which begins "<legal name> is
+a GB-domiciled bank operating in the banking sector, headquartered in London",
+made the name tokens dominate: every top-ten came back sharing a single name
+stem — ten Ellesmere entities, ten Saltmarsh entities — which looks like name
+matching rather than semantic matching. The identity sentence stays in the stored
+`profile` for display and for the lexical half of hybrid search.
+
+**Cost.** Embedding 100,000 notes takes about 11 minutes at ~150 docs/sec on this
+laptop, which is why it's a separate opt-in step (`npm run seed:vectors`) rather
+than part of `npm run demo`. The vectors are 146.5 MB on disk. The Redis index
+grows from 70.6 MB to roughly 305 MB once they're in it — the HNSW graph plus the
+raw vectors — which is the honest cost of the capability.
+
+### A Solr JSON serialisation trap
+
+Solr rejects vector components whose decimal representation is very long:
+
+```
+0.0000070493265411641914   (24 chars)  ->  HTTP 500, ClassCastException
+0.00000704932654           (16 chars)  ->  HTTP 200
+```
+
+It hit roughly 1 record in 20, which was enough to fail an entire 5,000-document
+batch while single-document posts of the *same field* succeeded — so it looked
+like a batch-size problem for a while. Redis, taking the raw float32 bytes, never
+cared.
+
+The fix is to serialise each component to 9 significant digits, which is the
+number needed to round-trip a float32 exactly (verified: 384/384 components
+identical after the round trip). Both engines therefore hold the same float32
+values; this is a serialisation fix, not a precision compromise. `solrFloats()`
+in `src/vectors.js` does it, and it's applied to the query vector as well as the
+indexed ones — a question's own embedding can contain the same long decimals.
+
+A second trap in the same area: the vector field must **not** declare
+`multiValued: false`. Every other field here does, but `DenseVectorField` manages
+its own arity, and declaring it makes Solr try to cast the float list to a single
+value and fail the batch.
+
 ## At 1,000,000 counterparties the result largely inverts
 
 The 100k numbers do **not** scale. `npm run seed:1m` loads a million records.
