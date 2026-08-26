@@ -99,8 +99,43 @@ async function ensureSchema() {
   }
 }
 
+// `docker compose up -d` returns as soon as the containers start, not when Solr
+// is ready to serve — its first boot has to create the core. On this machine
+// Solr happened to come up during the Redis seed, so the documented steps
+// worked; on a slower laptop, or the first run where the images are still being
+// pulled, the seeder would hit a Solr that isn't listening yet and fail with a
+// connection error. Waiting here makes the documented path reliable instead of
+// timing-dependent, and beats telling people to insert a sleep.
+async function waitForSolr(timeoutMs = 120000) {
+  const started = Date.now();
+  let announced = false;
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const res = await fetch(`${SOLR_URL}/admin/ping?wt=json`);
+      if (res.ok) {
+        if (announced) console.log(` ready after ${((Date.now() - started) / 1000).toFixed(1)}s`);
+        return;
+      }
+    } catch {
+      // Not listening yet.
+    }
+    if (!announced) {
+      process.stdout.write('Waiting for Solr to accept connections...');
+      announced = true;
+    } else {
+      process.stdout.write('.');
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  throw new Error(
+    `Solr did not become ready within ${timeoutMs / 1000}s at ${SOLR_URL}. `
+    + 'Check `docker compose ps` and `docker compose logs solr`.'
+  );
+}
+
 async function main() {
   console.log(`Solr at ${SOLR_URL}`);
+  await waitForSolr();
 
   // Clean slate, same as FLUSHALL on the Redis side.
   await solrPost('/update?commit=true', { delete: { query: '*:*' } });

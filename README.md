@@ -13,28 +13,55 @@ up in KYC and onboarding workflows.
 
 ## Quick start
 
-Requires **Docker** and **Node.js 18+**. Copy-paste the whole block:
+**Two commands after cloning:**
 
 ```bash
-git clone https://github.com/schoon/redis-v-solr-demo.git
-cd redis-v-solr-demo
-
-docker compose up -d          # Redis 8 on :6380, Solr 9 on :8983
 npm install
-npm run seed                  # generate 100k records, load both engines
-npm start
+npm run demo
 ```
 
 Then open **<http://localhost:3010>**.
 
-`npm run seed` takes about 10 seconds end to end. Redis is on **6380**, not the
-default 6379, so it can't collide with a Redis you already have running.
+`npm run demo` starts both containers, waits for Solr, generates 100,000
+counterparties, loads them into Redis and Solr, and starts the web server. On a
+machine that already has the Docker images it finishes in about **10 seconds**.
+The first ever run also pulls Redis 8 (166 MB) and Solr 9 (691 MB), so allow a
+few minutes for that.
+
+### Before you start
+
+| Need | Why |
+| ---- | --- |
+| **Docker** with Compose v2 (`docker compose`, not `docker-compose`) | runs both engines |
+| **≥ 4 GB** available to Docker | Solr is given a 2 GB heap; Redis uses ~250 MB at 100k |
+| **Node.js 18+** | the app uses global `fetch` |
+| Ports **3010**, **6380**, **8983** free | app, Redis, Solr |
+
+Redis is on **6380** rather than the default 6379 specifically so it can't
+collide with a Redis you already have running.
+
+### If you'd rather run the steps individually
+
+```bash
+docker compose up -d          # Redis 8 on :6380, Solr 9 on :8983
+npm run seed                  # generate 100k records, load both engines
+npm start                     # http://localhost:3010
+```
+
+`npm run seed` waits for Solr to accept connections before loading it, so
+there's no need to sleep between these.
 
 ### Stopping
 
 ```bash
 docker compose down           # add -v to delete the volumes too
 ```
+
+### Coming back later
+
+The containers hold no volumes, so a `docker compose down` discards the data.
+Re-run `npm run demo` — it's idempotent, and both seeders wipe their engine
+before loading.
 
 ## The scenarios
 
@@ -481,7 +508,10 @@ PORT=3011 npm start
 | Symptom | Fix |
 | ------- | --- |
 | `index cp:idx not found — run: npm run seed` | The Redis container was recreated. Re-run `npm run seed`. |
-| `Solr not reachable … is docker compose up?` | `docker compose ps` — Solr takes ~20s to become healthy on first boot. |
+| `Solr not reachable … is docker compose up?` | `docker compose ps`. `npm run seed` waits for Solr itself, so this usually means the container isn't running at all. |
+| `Solr did not become ready within 120s` | `docker compose logs solr`. Most often Docker is short on memory — Solr asks for a 2 GB heap, so give Docker at least 4 GB. |
+| `npm install` fails about root-owned files in the npm cache | A known npm cache-permission issue unrelated to this project: `npm install --cache "$(mktemp -d)"`. |
+| `docker: 'compose' is not a docker command` | Compose v2 needed. Either update Docker Desktop or substitute `docker-compose up -d`. |
 | Corpus banner says **COUNTS DIFFER** | The engines hold different data; the comparison is invalid until you re-run `npm run seed`. |
 | `Port 3010 is in use` | `PORT=3011 npm start` |
 

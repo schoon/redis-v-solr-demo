@@ -11,7 +11,8 @@
     "seed": "npm run generate && npm run seed:redis && npm run seed:solr",
     "seed:1m": "COUNT=1000000 npm run seed",
     "start": "node src/server.js",
-    "bench": "node src/bench.js"
+    "bench": "node src/bench.js",
+    "demo": "docker compose up -d && npm run seed && npm start"
   },
   "dependencies": {
     "express": "^4.21.2",
