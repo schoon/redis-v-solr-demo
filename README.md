@@ -97,6 +97,43 @@ Two UI controls worth knowing about:
 - **presentation mode** (or `P`) scales the whole UI for a projector.
   `1`–`9` switch scenarios, `Enter` re-runs, `Esc` returns to the overview.
 
+## Validating the results
+
+```bash
+npm run validate
+```
+
+Every expected answer is computed **independently** from
+`data/counterparties.jsonl` and `data/vectors.f32` in plain JavaScript, with no
+help from either engine, then compared against what the API returns. Two engines
+agreeing proves nothing if both are wrong, so agreement is never the test.
+
+27 checks, all passing as of 2026-08-26:
+
+| Tab | What is verified against ground truth |
+| --- | ------------------------------------- |
+| Prefix | Totals match a brute-force token scan exactly — 2,210 / 2,238 / 2,239 |
+| Typo-tolerant | Totals match a brute-force Levenshtein scan (152, 135), **and** every returned hit is confirmed within edit distance 1 of each query term in its source record |
+| Filtered | Total matches (82), and all 50 returned hits satisfy every one of the filters |
+| Geo | Counts match an independent haversine calculation exactly (1,543 at London/50km, 244 at Singapore/10km) |
+| Breakdown | All 58 buckets across three fields match brute-force counts **and** exposure sums |
+| Exact LEI | Four identifiers return the right record; an unknown identifier is not found on either engine |
+| Semantic | **Recall@10 measured against an exact brute-force scan of all 100,000 vectors** |
+| Index | Doc count matches the file, zero indexing failures, 100% indexed |
+| Timing | Median stability across 7 independent samples |
+
+Two findings worth carrying into a conversation:
+
+**Redis has higher vector recall.** Against exact nearest neighbours, Redis
+returned 9–10 of the true top 10; Solr returned 8–9. Both run HNSW so neither is
+exact by design, but Redis is finding more of the genuine nearest neighbours at
+the same `topK` — an accuracy result, not a speed one.
+
+**Redis's latency is more variable.** Across 7 samples the median varied 15–18%
+for Redis against 6–7% for Solr. Redis is faster on these scenarios and less
+consistent run-to-run; if someone quotes a single Redis figure to three decimal
+places, that variance is the honest caveat.
+
 ## Observed on one laptop
 
 **Measured 2026-08-26.** 100,000 counterparties, Redis 8.10.1 and Solr 9 both in
